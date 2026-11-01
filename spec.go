@@ -1,16 +1,35 @@
 package gfast
 
 import (
+	"fmt"
+	"io"
+	"net/http"
 	"reflect"
 	"strconv"
 	"strings"
+
+	jsonv2 "encoding/json/v2"
 )
 
 type apiDoc struct {
-	OpenAPI    string                   `json:"openapi"`
-	Info       docInfo                  `json:"info"`
-	Paths      map[string]map[string]op `json:"paths"`
-	Components *docComponents           `json:"components,omitempty"`
+	OpenAPI      string                   `json:"openapi"`
+	Info         docInfo                  `json:"info"`
+	Servers      []Server                 `json:"servers,omitempty"`
+	ExternalDocs *externalDoc             `json:"externalDocs,omitempty"`
+	Tags         []tagDoc                 `json:"tags,omitempty"`
+	Paths        map[string]map[string]op `json:"paths"`
+	Webhooks     map[string]any           `json:"webhooks,omitempty"`
+	Components   *docComponents           `json:"components,omitempty"`
+}
+
+type externalDoc struct {
+	Description string `json:"description,omitempty"`
+	URL         string `json:"url"`
+}
+
+type tagDoc struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
 }
 
 type docInfo struct {
@@ -19,33 +38,52 @@ type docInfo struct {
 }
 
 type docComponents struct {
-	SecuritySchemes map[string]secScheme `json:"securitySchemes,omitempty"`
+	Schemas         map[string]*docSchema `json:"schemas,omitempty"`
+	SecuritySchemes map[string]secScheme  `json:"securitySchemes,omitempty"`
 }
 
 type secScheme struct {
-	Type        string `json:"type"`
-	Scheme      string `json:"scheme,omitempty"`
-	In          string `json:"in,omitempty"`
-	Name        string `json:"name,omitempty"`
-	Description string `json:"description,omitempty"`
+	Type        string         `json:"type"`
+	Scheme      string         `json:"scheme,omitempty"`
+	In          string         `json:"in,omitempty"`
+	Name        string         `json:"name,omitempty"`
+	Description string         `json:"description,omitempty"`
+	Flows       *oauthFlowsDoc `json:"flows,omitempty"`
+}
+
+// oauthFlowsDoc is the OpenAPI OAuth 2.0 flows object.
+type oauthFlowsDoc struct {
+	AuthorizationCode *oauthFlowDoc `json:"authorizationCode,omitempty"`
+	ClientCredentials *oauthFlowDoc `json:"clientCredentials,omitempty"`
+	Password          *oauthFlowDoc `json:"password,omitempty"`
+}
+
+type oauthFlowDoc struct {
+	AuthorizationURL string            `json:"authorizationUrl,omitempty"`
+	TokenURL         string            `json:"tokenUrl"`
+	Scopes           map[string]string `json:"scopes"`
 }
 
 type op struct {
-	OperationID string                `json:"operationId,omitempty"`
-	Summary     string                `json:"summary,omitempty"`
-	Description string                `json:"description,omitempty"`
-	Tags        []string              `json:"tags,omitempty"`
-	Parameters  []opParam             `json:"parameters,omitempty"`
-	RequestBody *opBody               `json:"requestBody,omitempty"`
-	Responses   map[string]opResp     `json:"responses,omitempty"`
-	Security    []map[string][]string `json:"security,omitempty"`
+	OperationID  string                `json:"operationId,omitempty"`
+	Summary      string                `json:"summary,omitempty"`
+	Description  string                `json:"description,omitempty"`
+	Deprecated   bool                  `json:"deprecated,omitzero"`
+	Tags         []string              `json:"tags,omitempty"`
+	ExternalDocs *externalDoc          `json:"externalDocs,omitempty"`
+	Parameters   []opParam             `json:"parameters,omitempty"`
+	RequestBody  *opBody               `json:"requestBody,omitempty"`
+	Responses    map[string]opResp     `json:"responses,omitempty"`
+	Callbacks    map[string]any        `json:"callbacks,omitempty"`
+	Security     []map[string][]string `json:"security,omitempty"`
 }
 
 type opParam struct {
-	Name     string     `json:"name"`
-	In       string     `json:"in"`
-	Required bool       `json:"required,omitempty"`
-	Schema   *docSchema `json:"schema,omitempty"`
+	Name        string     `json:"name"`
+	In          string     `json:"in"`
+	Description string     `json:"description,omitempty"`
+	Required    bool       `json:"required,omitempty"`
+	Schema      *docSchema `json:"schema,omitempty"`
 }
 
 type opBody struct {
@@ -63,53 +101,113 @@ type opResp struct {
 }
 
 type docSchema struct {
-	Type       string                `json:"type,omitempty"`
-	Properties map[string]*docSchema `json:"properties,omitempty"`
-	Required   []string              `json:"required,omitempty"`
-	Items      *docSchema            `json:"items,omitempty"`
-	MinLength  *int                  `json:"minLength,omitempty"`
-	MaxLength  *int                  `json:"maxLength,omitempty"`
+	Ref              string                `json:"$ref,omitempty"`
+	Type             string                `json:"type,omitempty"`
+	Format           string                `json:"format,omitempty"`
+	Description      string                `json:"description,omitempty"`
+	Properties       map[string]*docSchema `json:"properties,omitempty"`
+	Required         []string              `json:"required,omitempty"`
+	Items            *docSchema            `json:"items,omitempty"`
+	MinLength        *int                  `json:"minLength,omitempty"`
+	MaxLength        *int                  `json:"maxLength,omitempty"`
+	MinItems         *int                  `json:"minItems,omitempty"`
+	MaxItems         *int                  `json:"maxItems,omitempty"`
+	Minimum          *float64              `json:"minimum,omitempty"`
+	Maximum          *float64              `json:"maximum,omitempty"`
+	ExclusiveMinimum *float64              `json:"exclusiveMinimum,omitempty"`
+	ExclusiveMaximum *float64              `json:"exclusiveMaximum,omitempty"`
+	Pattern          string                `json:"pattern,omitempty"`
+	Enum             []any                 `json:"enum,omitzero"`
+	Default          any                   `json:"default,omitzero"`
+	Example          schemaExample         `json:"example,omitzero"`
+}
+
+// schemaExample is present even when the example is 0, false, or "".
+type schemaExample struct {
+	v   any
+	set bool
+}
+
+func (e schemaExample) IsZero() bool { return !e.set }
+
+func (e schemaExample) MarshalJSON() ([]byte, error) {
+	return jsonv2.Marshal(e.v)
+}
+
+type schemaKey struct {
+	t   reflect.Type
+	top bool
+}
+
+func newOperation(route routeConfig, method, path string) op {
+	id := route.operationID
+	if id == "" {
+		id = operationID(method, path)
+	}
+	return op{
+		OperationID:  id,
+		Summary:      route.summary,
+		Description:  route.description,
+		Deprecated:   route.deprecated,
+		Tags:         route.tags,
+		ExternalDocs: route.externalDocs,
+		Callbacks:    route.callbacks,
+	}
 }
 
 func (a *App) addOperation(path, method string, route routeConfig, in reflect.Type, out reflect.Type, schemes map[string]*namedScheme, status int) {
-	operation := op{
-		OperationID: operationID(method, path),
-		Summary:     route.summary,
-		Description: route.description,
-		Tags:        route.tags,
-		Responses: map[string]opResp{
-			strconv.Itoa(status): {
-				Description: "Success",
-				Content: map[string]opMedia{
-					"application/json": {Schema: schemaFor(out)},
-				},
-			},
-		},
+	if !route.inSchema() {
+		return
 	}
-	if len(schemes) > 0 {
-		operation.Security = []map[string][]string{securityRequirement(schemes, route.scopes)}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	code, success := a.describeSuccess(status, out)
+	operation := newOperation(route, method, path)
+	operation.Responses = map[string]opResp{
+		strconv.Itoa(code): success,
 	}
+	a.addExtraResponses(operation.Responses, route.responses)
 	plan := planInput(in)
 	for _, p := range plan.params {
+		if p.loc == "form" || p.loc == "file" {
+			continue
+		}
 		operation.Parameters = append(operation.Parameters, opParam{
-			Name:     p.name,
-			In:       p.loc,
-			Required: p.loc == "path",
-			Schema:   &docSchema{Type: "string"},
+			Name:        p.name,
+			In:          p.loc,
+			Description: p.tag.Get("doc"),
+			Required:    p.loc == "path" || p.tag.Get("required") == "true",
+			Schema:      a.paramSchema(p),
 		})
 	}
-	if plan.hasBody {
-		bodyType := fieldType(in, plan.body)
+	if plan.hasBody || plan.flat {
+		var schema *docSchema
+		if plan.hasBody {
+			schema = a.schemaFor(plan.bodyType)
+			decorateSchema(schema, plan.bodyTag, plan.bodyType)
+		} else {
+			schema = a.schemaForMode(in, true)
+		}
 		operation.RequestBody = &opBody{
 			Required: true,
 			Content: map[string]opMedia{
-				"application/json": {Schema: schemaFor(bodyType)},
+				"application/json": {Schema: schema},
 			},
 		}
+	} else if ct, schema, required := a.formSchema(plan); schema != nil {
+		operation.RequestBody = &opBody{
+			Required: required,
+			Content:  map[string]opMedia{ct: {Schema: schema}},
+		}
 	}
+	a.putOperation(path, method, operation, schemes, route.scopes)
+}
 
-	a.mu.Lock()
-	defer a.mu.Unlock()
+// putOperation stores an operation. The caller holds a.mu.
+func (a *App) putOperation(path, method string, operation op, schemes map[string]*namedScheme, scopes []string) {
+	if len(schemes) > 0 {
+		operation.Security = []map[string][]string{securityRequirement(schemes, scopes)}
+	}
 	if a.doc.Paths == nil {
 		a.doc.Paths = map[string]map[string]op{}
 	}
@@ -122,40 +220,103 @@ func (a *App) addOperation(path, method string, route routeConfig, in reflect.Ty
 	if len(schemes) == 0 {
 		return
 	}
-	if a.doc.Components == nil {
-		a.doc.Components = &docComponents{}
-	}
-	if a.doc.Components.SecuritySchemes == nil {
-		a.doc.Components.SecuritySchemes = map[string]secScheme{}
+	comps := a.components()
+	if comps.SecuritySchemes == nil {
+		comps.SecuritySchemes = map[string]secScheme{}
 	}
 	for name, scheme := range schemes {
-		if _, ok := a.doc.Components.SecuritySchemes[name]; ok {
+		if _, ok := comps.SecuritySchemes[name]; ok {
 			continue
 		}
-		a.doc.Components.SecuritySchemes[name] = secScheme{
-			Type:        scheme.typ,
-			Scheme:      scheme.scheme,
-			In:          scheme.in,
-			Name:        scheme.param,
-			Description: scheme.description,
-		}
+		comps.SecuritySchemes[name] = a.documentedScheme(scheme)
 	}
 }
 
-func fieldType(t reflect.Type, index []int) reflect.Type {
-	if t.Kind() == reflect.Pointer {
-		t = t.Elem()
+func (a *App) describeSuccess(status int, out reflect.Type) (int, opResp) {
+	if out.Kind() == reflect.Pointer {
+		out = out.Elem()
 	}
-	for _, i := range index {
-		if t.Kind() == reflect.Pointer {
-			t = t.Elem()
+	switch out {
+	case reflect.TypeFor[Redirect]():
+		if status < 300 || status > 399 {
+			status = http.StatusTemporaryRedirect
 		}
-		t = t.Field(i).Type
+		return status, opResp{Description: "Redirect"}
+	case reflect.TypeFor[FileResponse]():
+		return status, binarySuccess()
+	case reflect.TypeFor[Events]():
+		return status, opResp{
+			Description: "Success",
+			Content: map[string]opMedia{
+				"text/event-stream": {Schema: &docSchema{Type: "string"}},
+			},
+		}
 	}
-	return t
+	if implementsReader(out) {
+		return status, binarySuccess()
+	}
+	return status, opResp{
+		Description: "Success",
+		Content: map[string]opMedia{
+			"application/json": {Schema: a.schemaFor(out)},
+		},
+	}
 }
 
-func schemaFor(t reflect.Type) *docSchema {
+func binarySuccess() opResp {
+	return opResp{
+		Description: "Success",
+		Content: map[string]opMedia{
+			"application/octet-stream": {Schema: &docSchema{Type: "string", Format: "binary"}},
+		},
+	}
+}
+
+func implementsReader(t reflect.Type) bool {
+	rt := reflect.TypeFor[io.Reader]()
+	if t.Implements(rt) {
+		return true
+	}
+	return t.Kind() != reflect.Pointer && reflect.PointerTo(t).Implements(rt)
+}
+
+func (a *App) addExtraResponses(responses map[string]opResp, extras []extraResponse) {
+	for _, extra := range extras {
+		key := strconv.Itoa(extra.status)
+		resp := responses[key]
+		if extra.description != "" {
+			resp.Description = extra.description
+		}
+		if resp.Description == "" {
+			resp.Description = http.StatusText(extra.status)
+		}
+		if resp.Description == "" {
+			resp.Description = "Response"
+		}
+		if extra.model != nil || extra.media != "" {
+			media := extra.media
+			if media == "" {
+				media = "application/json"
+			}
+			if resp.Content == nil {
+				resp.Content = map[string]opMedia{}
+			}
+			item := opMedia{}
+			if extra.model != nil {
+				item.Schema = a.schemaFor(reflect.TypeOf(extra.model))
+			}
+			resp.Content[media] = item
+		}
+		responses[key] = resp
+	}
+}
+
+// schemaFor and the methods below are called with a.mu held.
+func (a *App) schemaFor(t reflect.Type) *docSchema {
+	return a.schemaForMode(t, false)
+}
+
+func (a *App) schemaForMode(t reflect.Type, topJSON bool) *docSchema {
 	if t == nil {
 		return nil
 	}
@@ -173,44 +334,297 @@ func schemaFor(t reflect.Type) *docSchema {
 	case reflect.Float32, reflect.Float64:
 		return &docSchema{Type: "number"}
 	case reflect.Slice, reflect.Array:
-		return &docSchema{Type: "array", Items: schemaFor(t.Elem())}
+		return &docSchema{Type: "array", Items: a.schemaFor(t.Elem())}
 	case reflect.Struct:
-		props := map[string]*docSchema{}
-		var required []string
-		for i := 0; i < t.NumField(); i++ {
-			f := t.Field(i)
-			if f.PkgPath != "" && !f.Anonymous {
-				continue
-			}
-			if f.Name == "Body" || f.Name == "RawBody" {
-				continue
-			}
-			if _, ok := depTag(f); ok {
-				continue
-			}
-			if _, _, ok := paramTag(f); ok {
-				continue
-			}
-			name := jsonName(f)
-			if name == "-" {
-				continue
-			}
-			prop := schemaFor(f.Type)
-			if raw := f.Tag.Get("minLength"); raw != "" {
-				if n, err := strconv.Atoi(raw); err == nil {
-					prop.MinLength = &n
-				}
-			}
-			if raw := f.Tag.Get("maxLength"); raw != "" {
-				if n, err := strconv.Atoi(raw); err == nil {
-					prop.MaxLength = &n
-				}
-			}
-			props[name] = prop
-			required = append(required, name)
+		if t.Name() != "" {
+			return a.refStruct(t, topJSON)
 		}
-		return &docSchema{Type: "object", Properties: props, Required: required}
+		return a.structSchema(t, topJSON)
 	default:
 		return &docSchema{}
 	}
+}
+
+func (a *App) refStruct(t reflect.Type, topJSON bool) *docSchema {
+	if t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	key := schemaKey{t: t, top: topJSON}
+	if a.schemaIDs == nil {
+		a.schemaIDs = map[schemaKey]string{}
+		a.schemaUsed = map[string]struct{}{}
+	}
+	if name, ok := a.schemaIDs[key]; ok {
+		return schemaRef(name)
+	}
+	name := a.schemaName(t)
+	// Store the id before walking fields so a nested use of this type is a $ref.
+	a.schemaIDs[key] = name
+	built := a.structSchema(t, topJSON)
+	comps := a.components()
+	if comps.Schemas == nil {
+		comps.Schemas = map[string]*docSchema{}
+	}
+	comps.Schemas[name] = built
+	return schemaRef(name)
+}
+
+func schemaRef(name string) *docSchema {
+	return &docSchema{Ref: "#/components/schemas/" + name}
+}
+
+func (a *App) components() *docComponents {
+	if a.doc.Components == nil {
+		a.doc.Components = &docComponents{}
+	}
+	return a.doc.Components
+}
+
+func (a *App) schemaName(t reflect.Type) string {
+	base := t.Name()
+	if base == "" {
+		base = "Schema"
+	}
+	if _, taken := a.schemaUsed[base]; !taken {
+		a.schemaUsed[base] = struct{}{}
+		return base
+	}
+	candidate := base
+	if pkg := t.PkgPath(); pkg != "" {
+		candidate = strings.ReplaceAll(pkg, "/", "_") + "_" + base
+	}
+	if _, taken := a.schemaUsed[candidate]; !taken {
+		a.schemaUsed[candidate] = struct{}{}
+		return candidate
+	}
+	for n := 2; ; n++ {
+		next := fmt.Sprintf("%s_%d", candidate, n)
+		if _, taken := a.schemaUsed[next]; !taken {
+			a.schemaUsed[next] = struct{}{}
+			return next
+		}
+	}
+}
+
+func (a *App) structSchema(t reflect.Type, topJSON bool) *docSchema {
+	if t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	props := map[string]*docSchema{}
+	var required []string
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if f.PkgPath != "" && !f.Anonymous {
+			continue
+		}
+		if f.Name == "Body" || f.Name == "RawBody" {
+			continue
+		}
+		if _, ok := depTag(f); ok {
+			continue
+		}
+		if _, _, ok := paramTag(f); ok {
+			continue
+		}
+		if topJSON && f.Anonymous && f.Tag.Get("json") == "" {
+			nested := a.structSchema(f.Type, true)
+			if nested == nil {
+				continue
+			}
+			for name, prop := range nested.Properties {
+				props[name] = prop
+			}
+			required = append(required, nested.Required...)
+			continue
+		}
+		if topJSON && !isJSONField(f) {
+			continue
+		}
+		name := jsonName(f)
+		if name == "-" || name == "" {
+			continue
+		}
+		prop := a.schemaFor(f.Type)
+		decorateSchema(prop, f.Tag, f.Type)
+		props[name] = prop
+		required = append(required, name)
+	}
+	return &docSchema{Type: "object", Properties: props, Required: required}
+}
+
+func (a *App) paramSchema(p paramField) *docSchema {
+	var schema *docSchema
+	if p.loc == "file" {
+		schema = fileSchema(p.typ)
+	} else {
+		schema = a.schemaFor(p.typ)
+	}
+	decorateSchema(schema, p.tag, p.typ)
+	return schema
+}
+
+func fileSchema(t reflect.Type) *docSchema {
+	if t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t.Kind() == reflect.Slice || t.Kind() == reflect.Array {
+		return &docSchema{Type: "array", Items: &docSchema{Type: "string", Format: "binary"}}
+	}
+	return &docSchema{Type: "string", Format: "binary"}
+}
+
+func (a *App) formSchema(plan inputPlan) (string, *docSchema, bool) {
+	props := map[string]*docSchema{}
+	var required []string
+	hasFile := false
+	anyField := false
+	bodyRequired := false
+	for _, p := range plan.params {
+		if p.loc != "form" && p.loc != "file" {
+			continue
+		}
+		anyField = true
+		if p.loc == "file" {
+			hasFile = true
+		}
+		props[p.name] = a.paramSchema(p)
+		if p.tag.Get("required") == "true" {
+			required = append(required, p.name)
+			bodyRequired = true
+		}
+	}
+	if !anyField {
+		return "", nil, false
+	}
+	ct := "application/x-www-form-urlencoded"
+	if hasFile {
+		ct = "multipart/form-data"
+	}
+	return ct, &docSchema{Type: "object", Properties: props, Required: required}, bodyRequired
+}
+
+func decorateSchema(s *docSchema, tag reflect.StructTag, typ reflect.Type) {
+	if s == nil {
+		return
+	}
+	if doc := tag.Get("doc"); doc != "" {
+		s.Description = doc
+	}
+	if raw, ok := tag.Lookup(Example); ok {
+		s.Example = schemaExample{v: schemaValue(typ, raw), set: true}
+	}
+	if raw, ok := tag.Lookup("default"); ok && isScalarType(typ) {
+		s.Default = schemaValue(typ, raw)
+	}
+	base := typ
+	if base.Kind() == reflect.Pointer {
+		base = base.Elem()
+	}
+	target := s
+	targetKind := base.Kind()
+	if base.Kind() == reflect.Slice || base.Kind() == reflect.Array {
+		if raw := tag.Get("minItems"); raw != "" {
+			if n, err := strconv.Atoi(raw); err == nil {
+				s.MinItems = &n
+			}
+		}
+		if raw := tag.Get("maxItems"); raw != "" {
+			if n, err := strconv.Atoi(raw); err == nil {
+				s.MaxItems = &n
+			}
+		}
+		if s.Items != nil {
+			target = s.Items
+		}
+		targetKind = base.Elem().Kind()
+		if targetKind == reflect.Pointer {
+			targetKind = base.Elem().Elem().Kind()
+		}
+	}
+	if raw := tag.Get("minLength"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			target.MinLength = &n
+		}
+	}
+	if raw := tag.Get("maxLength"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			target.MaxLength = &n
+		}
+	}
+	if raw := tag.Get("pattern"); raw != "" {
+		target.Pattern = raw
+	}
+	if raw := tag.Get("format"); raw != "" {
+		target.Format = raw
+	}
+	if raw := tag.Get("enum"); raw != "" {
+		parts := splitCSV(raw)
+		vals := make([]any, len(parts))
+		elem := constraintType(typ)
+		for i, part := range parts {
+			vals[i] = schemaValue(elem, part)
+		}
+		target.Enum = vals
+	}
+	if isNumeric(targetKind) {
+		if n := floatPtr(tag.Get("gt")); n != nil {
+			target.ExclusiveMinimum = n
+		}
+		if n := floatPtr(tag.Get("ge")); n != nil {
+			target.Minimum = n
+		}
+		if n := floatPtr(tag.Get("lt")); n != nil {
+			target.ExclusiveMaximum = n
+		}
+		if n := floatPtr(tag.Get("le")); n != nil {
+			target.Maximum = n
+		}
+	}
+}
+
+func schemaValue(t reflect.Type, raw string) any {
+	if t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	switch t.Kind() {
+	case reflect.String:
+		return raw
+	case reflect.Bool:
+		v, err := strconv.ParseBool(raw)
+		if err != nil {
+			return raw
+		}
+		return v
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		v, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			return raw
+		}
+		return v
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		v, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil {
+			return raw
+		}
+		return v
+	case reflect.Float32, reflect.Float64:
+		v, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return raw
+		}
+		return v
+	default:
+		return raw
+	}
+}
+
+func floatPtr(raw string) *float64 {
+	if raw == "" {
+		return nil
+	}
+	n, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return nil
+	}
+	return &n
 }

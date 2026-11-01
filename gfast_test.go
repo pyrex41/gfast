@@ -52,6 +52,12 @@ var userFromSession = gfast.Dep("UserFromSession", func(ctx context.Context, s *
 
 var headerKey = gfast.APIKeyHeader("X-API-Key")
 var queryKey = gfast.APIKeyQuery("api_key")
+var optionalBearer = gfast.BearerAuth(gfast.Optional())
+var optionalBasic = gfast.BasicAuth(gfast.Optional())
+var optionalHeader = gfast.APIKeyHeader("X-API-Key", gfast.Optional())
+var optionalQuery = gfast.APIKeyQuery("api_key", gfast.Optional())
+var cookieKey = gfast.APIKeyCookie("session")
+var optionalCookie = gfast.APIKeyCookie("session", gfast.Optional())
 
 type cycleA struct{ N int }
 type cycleB struct{ N int }
@@ -91,8 +97,25 @@ func TestRouteValidationDocsAndStatus(t *testing.T) {
 	}
 
 	bad := app.Request(http.MethodPost, "/items", []byte(`{"title":"a"}`))
-	if bad.Status != http.StatusUnprocessableEntity {
+	if bad.Status != http.StatusUnprocessableEntity || !strings.Contains(string(bad.Body), "title must be at least 2") {
 		t.Fatalf("validation status %d body %s", bad.Status, bad.Body)
+	}
+	var problemBody struct {
+		Detail string `json:"detail"`
+		Errors []struct {
+			Loc  []string `json:"loc"`
+			Type string   `json:"type"`
+			Msg  string   `json:"msg"`
+		} `json:"errors"`
+	}
+	if err := bad.JSON(&problemBody); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(problemBody.Detail, "title must be at least 2") || len(problemBody.Errors) != 1 {
+		t.Fatalf("problem %#v", problemBody)
+	}
+	if problemBody.Errors[0].Type == "" || problemBody.Errors[0].Msg == "" || len(problemBody.Errors[0].Loc) == 0 {
+		t.Fatalf("errors %#v", problemBody.Errors)
 	}
 
 	created := app.Request(http.MethodPost, "/items", []byte(`{"title":"ab"}`))
@@ -136,9 +159,7 @@ func TestRouteValidationDocsAndStatus(t *testing.T) {
 		t.Fatalf("preset status %d", preset.Status)
 	}
 	missing := app.Request(http.MethodGet, "/docs/missing.js", nil)
-	if missing.Status != http.StatusNotFound {
-		t.Fatalf("missing asset status %d", missing.Status)
-	}
+	assertProblem(t, missing, http.StatusNotFound, "Not Found")
 	spec := app.Request(http.MethodGet, "/openapi.json", nil)
 	if spec.Status != http.StatusOK || !strings.Contains(string(spec.Body), `"Items"`) {
 		t.Fatalf("openapi status %d body %s", spec.Status, spec.Body)
@@ -434,6 +455,249 @@ func toString(v any) string {
 		return e.Error()
 	}
 	return ""
+}
+
+func TestOptionalCredentialsAndAPIKeyCookie(t *testing.T) {
+	_ = optionalBearer
+	_ = optionalBasic
+	_ = optionalHeader
+	_ = optionalQuery
+	_ = cookieKey
+	_ = optionalCookie
+
+	app := gfast.New()
+	var bearerHits, basicHits, headerHits, queryHits, cookieHits, eitherHits, requiredCookieHits int
+	gfast.Get(app, "/bearer", func(ctx context.Context, in *struct {
+		Cred gfast.Bearer `gfast:"dep=bearerAuthOptional"`
+	}) (*struct {
+		Token  string   `json:"token"`
+		Scopes []string `json:"scopes"`
+	}, error) {
+		bearerHits++
+		return &struct {
+			Token  string   `json:"token"`
+			Scopes []string `json:"scopes"`
+		}{Token: in.Cred.Token, Scopes: append([]string(nil), in.Cred.Scopes...)}, nil
+	}, gfast.Scopes("items:read"))
+	gfast.Get(app, "/basic", func(ctx context.Context, in *struct {
+		Cred gfast.Basic `gfast:"dep=basicAuthOptional"`
+	}) (*struct {
+		User string `json:"user"`
+		Pass string `json:"pass"`
+	}, error) {
+		basicHits++
+		return &struct {
+			User string `json:"user"`
+			Pass string `json:"pass"`
+		}{User: in.Cred.Username, Pass: in.Cred.Password}, nil
+	})
+	gfast.Get(app, "/header", func(ctx context.Context, in *struct {
+		Key gfast.APIKey `gfast:"dep=apiKey_header_X_API_Key_optional"`
+	}) (*struct {
+		Value string `json:"value"`
+		Name  string `json:"name"`
+		In    string `json:"in"`
+	}, error) {
+		headerHits++
+		return &struct {
+			Value string `json:"value"`
+			Name  string `json:"name"`
+			In    string `json:"in"`
+		}{Value: in.Key.Value, Name: in.Key.Name, In: in.Key.In}, nil
+	})
+	gfast.Get(app, "/query", func(ctx context.Context, in *struct {
+		Key gfast.APIKey `gfast:"dep=apiKey_query_api_key_optional"`
+	}) (*struct {
+		Value string `json:"value"`
+	}, error) {
+		queryHits++
+		return &struct {
+			Value string `json:"value"`
+		}{Value: in.Key.Value}, nil
+	})
+	gfast.Get(app, "/cookie", func(ctx context.Context, in *struct {
+		Key gfast.APIKey `gfast:"dep=apiKey_cookie_session"`
+	}) (*struct {
+		Value string `json:"value"`
+		Name  string `json:"name"`
+		In    string `json:"in"`
+	}, error) {
+		requiredCookieHits++
+		return &struct {
+			Value string `json:"value"`
+			Name  string `json:"name"`
+			In    string `json:"in"`
+		}{Value: in.Key.Value, Name: in.Key.Name, In: in.Key.In}, nil
+	})
+	gfast.Get(app, "/cookie-optional", func(ctx context.Context, in *struct {
+		Key gfast.APIKey `gfast:"dep=apiKey_cookie_session_optional"`
+	}) (*struct {
+		Value string `json:"value"`
+		Name  string `json:"name"`
+		In    string `json:"in"`
+	}, error) {
+		cookieHits++
+		return &struct {
+			Value string `json:"value"`
+			Name  string `json:"name"`
+			In    string `json:"in"`
+		}{Value: in.Key.Value, Name: in.Key.Name, In: in.Key.In}, nil
+	})
+	gfast.Get(app, "/either", func(ctx context.Context, in *struct {
+		Cred gfast.Bearer `gfast:"dep=bearerAuthOptional"`
+		Key  gfast.APIKey `gfast:"dep=apiKey_cookie_session_optional"`
+	}) (*struct {
+		Token string `json:"token"`
+		Key   string `json:"key"`
+	}, error) {
+		eitherHits++
+		return &struct {
+			Token string `json:"token"`
+			Key   string `json:"key"`
+		}{Token: in.Cred.Token, Key: in.Key.Value}, nil
+	}, gfast.Scopes("items:read"))
+	group := app.Group("/v1", gfast.Require(optionalBearer), gfast.Scopes("group:read"))
+	var groupHits int
+	gfast.Get(group, "/open", func(ctx context.Context, in *struct{}) (*struct{ OK bool }, error) {
+		groupHits++
+		return &struct{ OK bool }{OK: true}, nil
+	})
+
+	missing := app.Request(http.MethodGet, "/bearer", nil)
+	if missing.Status != http.StatusOK || bearerHits != 1 || !strings.Contains(string(missing.Body), `"token":""`) || strings.Contains(string(missing.Body), "items:read") {
+		t.Fatalf("missing bearer %d %s hits %d", missing.Status, missing.Body, bearerHits)
+	}
+	other := app.Request(http.MethodGet, "/bearer", nil, http.Header{"Authorization": []string{"Token nope"}})
+	if other.Status != http.StatusOK || bearerHits != 2 {
+		t.Fatalf("other scheme %d %s", other.Status, other.Body)
+	}
+	badBearer := app.Request(http.MethodGet, "/bearer", nil, http.Header{"Authorization": []string{"Bearer"}})
+	if badBearer.Status != http.StatusUnauthorized || bearerHits != 2 || badBearer.Header.Get("WWW-Authenticate") != "Bearer" || !strings.Contains(string(badBearer.Body), "missing bearer token") {
+		t.Fatalf("bad bearer %d %s challenge %q", badBearer.Status, badBearer.Body, badBearer.Header.Get("WWW-Authenticate"))
+	}
+	blank := app.Request(http.MethodGet, "/bearer", nil, http.Header{"Authorization": []string{"Bearer   "}})
+	if blank.Status != http.StatusUnauthorized || bearerHits != 2 {
+		t.Fatalf("blank bearer %d hits %d", blank.Status, bearerHits)
+	}
+	okBearer := app.Request(http.MethodGet, "/bearer", nil, http.Header{"Authorization": []string{"bearer nope"}})
+	if okBearer.Status != http.StatusOK || bearerHits != 3 || !strings.Contains(string(okBearer.Body), `"token":"nope"`) || !strings.Contains(string(okBearer.Body), "items:read") {
+		t.Fatalf("token passed through %d %s", okBearer.Status, okBearer.Body)
+	}
+
+	noBasic := app.Request(http.MethodGet, "/basic", nil)
+	if noBasic.Status != http.StatusOK || basicHits != 1 || !strings.Contains(string(noBasic.Body), `"user":""`) {
+		t.Fatalf("missing basic %d %s", noBasic.Status, noBasic.Body)
+	}
+	basicWrong := app.Request(http.MethodGet, "/basic", nil, http.Header{"Authorization": []string{"Bearer nope"}})
+	if basicWrong.Status != http.StatusOK || basicHits != 2 {
+		t.Fatalf("basic other scheme %d %s", basicWrong.Status, basicWrong.Body)
+	}
+	basicBad := app.Request(http.MethodGet, "/basic", nil, http.Header{"Authorization": []string{"Basic !!!!"}})
+	if basicBad.Status != http.StatusUnauthorized || basicHits != 2 || basicBad.Header.Get("WWW-Authenticate") != `Basic realm="api"` {
+		t.Fatalf("bad basic %d %s challenge %q", basicBad.Status, basicBad.Body, basicBad.Header.Get("WWW-Authenticate"))
+	}
+	basicOK := app.Request(http.MethodGet, "/basic", nil, http.Header{"Authorization": []string{"Basic dTpw"}})
+	if basicOK.Status != http.StatusOK || !strings.Contains(string(basicOK.Body), `"user":"u"`) || !strings.Contains(string(basicOK.Body), `"pass":"p"`) {
+		t.Fatalf("basic ok %d %s", basicOK.Status, basicOK.Body)
+	}
+
+	noHeader := app.Request(http.MethodGet, "/header", nil)
+	if noHeader.Status != http.StatusOK || headerHits != 1 || !strings.Contains(string(noHeader.Body), `"value":""`) || strings.Contains(string(noHeader.Body), "X-API-Key") {
+		t.Fatalf("missing header key %d %s", noHeader.Status, noHeader.Body)
+	}
+	emptyHeader := app.Request(http.MethodGet, "/header", nil, http.Header{"X-API-Key": []string{""}})
+	if emptyHeader.Status != http.StatusUnauthorized || headerHits != 1 || emptyHeader.Header.Get("WWW-Authenticate") != "X-API-Key" {
+		t.Fatalf("empty header key %d %s challenge %q", emptyHeader.Status, emptyHeader.Body, emptyHeader.Header.Get("WWW-Authenticate"))
+	}
+	headerOK := app.Request(http.MethodGet, "/header", nil, http.Header{"X-API-Key": []string{"k1"}})
+	if headerOK.Status != http.StatusOK || !strings.Contains(string(headerOK.Body), `"value":"k1"`) || !strings.Contains(string(headerOK.Body), `"in":"header"`) {
+		t.Fatalf("header key %d %s", headerOK.Status, headerOK.Body)
+	}
+
+	noQuery := app.Request(http.MethodGet, "/query", nil)
+	if noQuery.Status != http.StatusOK || queryHits != 1 {
+		t.Fatalf("missing query %d %s", noQuery.Status, noQuery.Body)
+	}
+	emptyQuery := app.Request(http.MethodGet, "/query?api_key=", nil)
+	if emptyQuery.Status != http.StatusUnauthorized || queryHits != 1 || emptyQuery.Header.Get("WWW-Authenticate") != "apiKey" {
+		t.Fatalf("empty query %d %s", emptyQuery.Status, emptyQuery.Body)
+	}
+	queryOK := app.Request(http.MethodGet, "/query?api_key=k2", nil)
+	if queryOK.Status != http.StatusOK || !strings.Contains(string(queryOK.Body), "k2") {
+		t.Fatalf("query %d %s", queryOK.Status, queryOK.Body)
+	}
+
+	noCookie := app.Request(http.MethodGet, "/cookie", nil)
+	if noCookie.Status != http.StatusUnauthorized || requiredCookieHits != 0 || noCookie.Header.Get("WWW-Authenticate") != "apiKey" || !strings.Contains(string(noCookie.Body), "missing api key") {
+		t.Fatalf("missing cookie %d %s challenge %q", noCookie.Status, noCookie.Body, noCookie.Header.Get("WWW-Authenticate"))
+	}
+	cookieOK := app.Request(http.MethodGet, "/cookie", nil, http.Header{"Cookie": []string{"session=s1"}})
+	if cookieOK.Status != http.StatusOK || requiredCookieHits != 1 || !strings.Contains(string(cookieOK.Body), `"value":"s1"`) || !strings.Contains(string(cookieOK.Body), `"name":"session"`) || !strings.Contains(string(cookieOK.Body), `"in":"cookie"`) {
+		t.Fatalf("cookie %d %s", cookieOK.Status, cookieOK.Body)
+	}
+	noOptCookie := app.Request(http.MethodGet, "/cookie-optional", nil)
+	if noOptCookie.Status != http.StatusOK || cookieHits != 1 || !strings.Contains(string(noOptCookie.Body), `"value":""`) || strings.Contains(string(noOptCookie.Body), `"name":"session"`) {
+		t.Fatalf("optional cookie %d %s", noOptCookie.Status, noOptCookie.Body)
+	}
+	emptyCookie := app.Request(http.MethodGet, "/cookie-optional", nil, http.Header{"Cookie": []string{"session="}})
+	if emptyCookie.Status != http.StatusUnauthorized || cookieHits != 1 {
+		t.Fatalf("empty cookie %d hits %d body %s", emptyCookie.Status, cookieHits, emptyCookie.Body)
+	}
+
+	neither := app.Request(http.MethodGet, "/either", nil)
+	if neither.Status != http.StatusOK || eitherHits != 1 {
+		t.Fatalf("either missing %d %s", neither.Status, neither.Body)
+	}
+	justCookie := app.Request(http.MethodGet, "/either", nil, http.Header{"Cookie": []string{"session=s2"}})
+	if justCookie.Status != http.StatusOK || !strings.Contains(string(justCookie.Body), `"token":""`) || !strings.Contains(string(justCookie.Body), `"key":"s2"`) {
+		t.Fatalf("cookie only %d %s", justCookie.Status, justCookie.Body)
+	}
+	badEither := app.Request(http.MethodGet, "/either", nil, http.Header{"Authorization": []string{"Bearer "}, "Cookie": []string{"session=s2"}})
+	if badEither.Status != http.StatusUnauthorized || eitherHits != 2 {
+		t.Fatalf("malformed bearer blocked cookie %d hits %d", badEither.Status, eitherHits)
+	}
+
+	openGroup := app.Request(http.MethodGet, "/v1/open", nil)
+	if openGroup.Status != http.StatusOK || groupHits != 1 {
+		t.Fatalf("optional require %d %s", openGroup.Status, openGroup.Body)
+	}
+	closedGroup := app.Request(http.MethodGet, "/v1/open", nil, http.Header{"Authorization": []string{"Bearer"}})
+	if closedGroup.Status != http.StatusUnauthorized || groupHits != 1 {
+		t.Fatalf("optional require malformed %d hits %d", closedGroup.Status, groupHits)
+	}
+
+	spec := app.Request(http.MethodGet, "/openapi.json", nil)
+	var doc map[string]any
+	if err := json.Unmarshal(spec.Body, &doc); err != nil {
+		t.Fatal(err)
+	}
+	paths := doc["paths"].(map[string]any)
+	bearerOp := paths["/bearer"].(map[string]any)["get"].(map[string]any)
+	raw, _ := json.Marshal(bearerOp["security"])
+	if string(raw) != `[{"bearerAuth":["items:read"]}]` {
+		t.Fatalf("bearer security %s", raw)
+	}
+	eitherOp := paths["/either"].(map[string]any)["get"].(map[string]any)
+	sec := eitherOp["security"].([]any)[0].(map[string]any)
+	scopes, _ := sec["bearerAuth"].([]any)
+	if len(scopes) != 1 || scopes[0] != "items:read" {
+		t.Fatalf("either scopes %#v", sec["bearerAuth"])
+	}
+	if _, ok := sec["apiKey_cookie_session"]; !ok {
+		t.Fatalf("either security %#v", sec)
+	}
+	schemes := doc["components"].(map[string]any)["securitySchemes"].(map[string]any)
+	cookieScheme := schemes["apiKey_cookie_session"].(map[string]any)
+	if cookieScheme["type"] != "apiKey" || cookieScheme["in"] != "cookie" || cookieScheme["name"] != "session" || cookieScheme["description"] != "API key." {
+		t.Fatalf("cookie scheme %#v", cookieScheme)
+	}
+	if _, ok := schemes["apiKey_cookie_session_optional"]; ok {
+		t.Fatal("optional suffix became a second scheme")
+	}
+	bearerScheme := schemes["bearerAuth"].(map[string]any)
+	if bearerScheme["scheme"] != "bearer" {
+		t.Fatalf("bearer scheme %#v", bearerScheme)
+	}
 }
 
 func TestNotFoundHelper(t *testing.T) {

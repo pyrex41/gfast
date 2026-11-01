@@ -13,6 +13,14 @@ type httpError struct {
 	status int
 	detail string
 	header http.Header
+	errors []fieldIssue
+}
+
+// fieldIssue is one object in a 422 problem's errors array.
+type fieldIssue struct {
+	Loc  []string `json:"loc"`
+	Type string   `json:"type"`
+	Msg  string   `json:"msg"`
 }
 
 func (e *httpError) Error() string { return e.detail }
@@ -20,6 +28,8 @@ func (e *httpError) Error() string { return e.detail }
 func (e *httpError) GetStatus() int { return e.status }
 
 func (e *httpError) Headers() http.Header { return e.header }
+
+func (e *httpError) validationErrors() []fieldIssue { return e.errors }
 
 func statusErr(code int, msg string) error {
 	return &httpError{status: code, detail: msg}

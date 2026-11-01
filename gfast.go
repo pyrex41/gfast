@@ -30,10 +30,15 @@ type App struct {
 	state routerState
 	doc   apiDoc
 
-	mu        sync.Mutex
-	overrides map[int]override
-	started   bool
-	cfg       appConfig
+	mu         sync.Mutex
+	overrides  map[int]override
+	started    bool
+	cfg        appConfig
+	middleware []func(http.Handler) http.Handler
+	oauth      *oauthServer
+	schemaIDs  map[schemaKey]string
+	schemaUsed map[string]struct{}
+	appState   map[string]any
 }
 
 // Group is a path prefix that shares route options, including Require.
@@ -50,18 +55,25 @@ type routerState struct {
 func (s *routerState) isRouter() *routerState { return s }
 
 type requestState struct {
-	app     *App
-	req     *http.Request
-	memo    map[int]reflect.Value
-	stack   map[int]bool
-	closers []ioCloser
-	tasks   []func()
-	scopes  []string
+	app         *App
+	req         *http.Request
+	memo        map[int]reflect.Value
+	stack       map[int]bool
+	closers     []ioCloser
+	tasks       []func()
+	scopes      []string
+	resp        *Response
+	socket      *Conn
+	sessionOn   bool
+	session     map[string]any
+	sessionSnap []byte
 }
 
 type ioCloser interface{ Close() error }
 
 type ctxKey struct{}
+
+type appStateKey struct{}
 
 // New builds an app.
 func New(opts ...Option) *App {
@@ -69,28 +81,54 @@ func New(opts ...Option) *App {
 		overrides: map[int]override{},
 		cfg:       appConfig{title: "API", version: "0.0.0"},
 		mux:       http.NewServeMux(),
+		appState:  map[string]any{},
 	}
 	bag := &optionBag{app: &app.cfg, route: &app.state.route}
 	for _, opt := range opts {
 		opt(bag)
 	}
 	app.doc = apiDoc{
-		OpenAPI: "3.1.0",
-		Info:    docInfo{Title: app.cfg.title, Version: app.cfg.version},
-		Paths:   map[string]map[string]op{},
+		OpenAPI:      "3.1.0",
+		Info:         docInfo{Title: app.cfg.title, Version: app.cfg.version},
+		Servers:      append([]Server(nil), app.cfg.servers...),
+		ExternalDocs: app.cfg.externalDocs,
+		Tags:         append([]tagDoc(nil), app.cfg.tags...),
+		Paths:        map[string]map[string]op{},
+		Webhooks:     copyAnyMap(app.cfg.webhooks),
 	}
 	app.state.app = app
-	app.mux.HandleFunc("GET /openapi.json", app.serveSpec)
-	registerDocs(app.mux, app)
-	app.root = app.withState(app.mux)
-	if app.cfg.cors {
-		app.root = app.withCORS(app.root)
+	if app.cfg.oauth != nil {
+		app.oauth = newOAuthServer(app.cfg.oauth)
+		registerOAuth(app.mux, app.oauth)
 	}
+	if app.cfg.docsOn() {
+		app.mux.HandleFunc("GET /openapi.json", app.serveSpec)
+		registerDocs(app.mux, app)
+	}
+	app.root = app.assemble()
 	return app
 }
 
-// Handler returns the HTTP handler, including the docs routes.
-func (a *App) Handler() http.Handler { return a.root }
+// Use registers middleware. It runs outside the router and inside CORS when
+// CORS is set. The first middleware registered is the outermost.
+// Gzip, when set, wraps this middleware so it sees the uncompressed response.
+func (a *App) Use(mw func(http.Handler) http.Handler) {
+	if mw == nil {
+		panic("gfast: Use got nil middleware")
+	}
+	a.mu.Lock()
+	a.middleware = append(a.middleware, mw)
+	a.root = a.assemble()
+	a.mu.Unlock()
+}
+
+// Handler returns the HTTP handler, including middleware and the docs routes.
+func (a *App) Handler() http.Handler {
+	a.mu.Lock()
+	h := a.root
+	a.mu.Unlock()
+	return h
+}
 
 func (a *App) isRouter() *routerState { return &a.state }
 
@@ -237,7 +275,7 @@ func register[I, O any](st *routerState, method, path string, handler func(conte
 	scopes := append([]string(nil), route.scopes...)
 	st.app.addOperation(full, method, route, inType, outType, schemes, status)
 
-	st.app.mux.HandleFunc(method+" "+full, func(w http.ResponseWriter, r *http.Request) {
+	h := func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		rst, err := stateFrom(ctx)
 		if err != nil {
@@ -245,6 +283,10 @@ func register[I, O any](st *routerState, method, path string, handler func(conte
 			return
 		}
 		rst.scopes = scopes
+		if err := enforceCSRF(r, route.skipCSRF); err != nil {
+			writeErr(w, err)
+			return
+		}
 		in := new(I)
 		inVal := reflect.ValueOf(in).Elem()
 		if err := bindInput(r, inVal, plan); err != nil {
@@ -266,16 +308,12 @@ func register[I, O any](st *routerState, method, path string, handler func(conte
 			assignField(fieldByIndexAlloc(inVal, field.index), val)
 		}
 		out, err := handler(ctx, in)
-		if err != nil {
-			writeErr(w, err)
-			return
-		}
-		if out == nil {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		writeJSON(w, status, out)
-	})
+		writeResult(w, r, rst.resp, status, out, err)
+	}
+	st.app.mux.HandleFunc(method+" "+full, h)
+	if method == http.MethodGet {
+		st.app.mux.HandleFunc(http.MethodHead+" "+full, h)
+	}
 }
 
 func securityRequirement(schemes map[string]*namedScheme, scopes []string) map[string][]string {
@@ -298,18 +336,50 @@ func securityRequirement(schemes map[string]*namedScheme, scopes []string) map[s
 func (a *App) serveSpec(w http.ResponseWriter, _ *http.Request) {
 	a.mu.Lock()
 	body, err := jsonv2.Marshal(a.doc)
+	var hooks []func(map[string]any)
+	hooks = append(hooks, a.cfg.specHooks...)
 	a.mu.Unlock()
 	if err != nil {
 		writeErr(w, err)
 		return
+	}
+	if len(hooks) > 0 {
+		var doc map[string]any
+		if err := jsonv2.Unmarshal(body, &doc); err != nil {
+			writeErr(w, err)
+			return
+		}
+		for _, hook := range hooks {
+			hook(doc)
+		}
+		body, err = jsonv2.Marshal(doc)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
 }
 
+func copyAnyMap(in map[string]any) map[string]any {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
+}
+
 func htmlText(s string) string {
 	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(s)
+}
+
+func htmlAttr(s string) string {
+	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&#34;", "'", "&#39;").Replace(s)
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
@@ -324,9 +394,10 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 }
 
 type problem struct {
-	Title  string `json:"title"`
-	Status int    `json:"status"`
-	Detail string `json:"detail,omitempty"`
+	Title  string       `json:"title"`
+	Status int          `json:"status"`
+	Detail string       `json:"detail,omitempty"`
+	Errors []fieldIssue `json:"errors,omitempty"`
 }
 
 func writeErr(w http.ResponseWriter, err error) {
@@ -345,7 +416,12 @@ func writeErr(w http.ResponseWriter, err error) {
 			}
 		}
 	}
-	payload, mErr := jsonv2.Marshal(problem{Title: http.StatusText(status), Status: status, Detail: detail})
+	var issues []fieldIssue
+	var listed interface{ validationErrors() []fieldIssue }
+	if errors.As(err, &listed) {
+		issues = listed.validationErrors()
+	}
+	payload, mErr := jsonv2.Marshal(problem{Title: http.StatusText(status), Status: status, Detail: detail, Errors: issues})
 	if mErr != nil {
 		http.Error(w, detail, status)
 		return
@@ -378,13 +454,36 @@ func (a *App) override(id int) (override, bool) {
 
 func (a *App) withState(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// ServeMux serves HEAD on a GET pattern, and ResponseRecorder keeps
+		// whatever the handler writes. Drop the body here so App.Request
+		// matches the empty HEAD body a net/http server would send, while
+		// the headers stay the ones the GET handler produced.
+		dst := w
+		var head *headCapture
+		if r.Method == http.MethodHead {
+			head = &headCapture{header: make(http.Header)}
+			dst = head
+		}
 		st := &requestState{
 			app:   a,
 			req:   r,
 			memo:  map[int]reflect.Value{},
 			stack: map[int]bool{},
 		}
-		r = r.WithContext(context.WithValue(r.Context(), ctxKey{}, st))
+		var sw *sessionWriter
+		if cfg := a.cfg.sessions; cfg != nil {
+			st.sessionOn = true
+			st.session, st.sessionSnap = loadSession(r, cfg)
+			if a.cfg.csrfToken {
+				ensureCSRFToken(st.session)
+			}
+			sw = &sessionWriter{ResponseWriter: dst, cfg: cfg, st: st, csrf: a.cfg.csrfToken}
+			dst = sw
+		}
+		ctx := context.WithValue(r.Context(), ctxKey{}, st)
+		ctx = context.WithValue(ctx, appStateKey{}, a.appState)
+		r = r.WithContext(ctx)
+		st.req = r
 		defer func() {
 			for i := len(st.closers) - 1; i >= 0; i-- {
 				_ = st.closers[i].Close()
@@ -395,38 +494,38 @@ func (a *App) withState(next http.Handler) http.Handler {
 				task()
 			}
 		}()
-		next.ServeHTTP(w, r)
+		if head != nil {
+			defer head.finish(w)
+		}
+		if sw != nil {
+			defer sw.finish()
+		}
+		next.ServeHTTP(dst, r)
 	})
 }
 
-func (a *App) withCORS(next http.Handler) http.Handler {
-	allowed := map[string]struct{}{}
-	star := len(a.cfg.origins) == 0
-	for _, origin := range a.cfg.origins {
-		if origin == "*" {
-			star = true
-		}
-		allowed[origin] = struct{}{}
+// assemble stacks handlers from the outside in: trusted host, HTTPS redirect,
+// CORS, gzip, Use, then the router. Use stays outside the router and inside
+// CORS. Gzip stays outside Use so middleware sees the uncompressed response.
+func (a *App) assemble() http.Handler {
+	var h http.Handler = http.HandlerFunc(a.serve)
+	h = a.withState(h)
+	for i := len(a.middleware) - 1; i >= 0; i-- {
+		h = a.middleware[i](h)
 	}
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		origin := r.Header.Get("Origin")
-		if origin != "" && (star || has(allowed, origin)) {
-			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Vary", "Origin")
-			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-		}
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-func has(set map[string]struct{}, key string) bool {
-	_, ok := set[key]
-	return ok
+	if a.cfg.gzip {
+		h = withGzip(a.cfg.gzipLevel, h)
+	}
+	if a.cfg.cors {
+		h = withCORS(newCORSPolicy(a.cfg), h)
+	}
+	if a.cfg.httpsRedirect {
+		h = withHTTPSRedirect(h)
+	}
+	if a.cfg.trustedOn {
+		h = withTrustedHost(a.cfg.trustedHosts, h)
+	}
+	return h
 }
 
 func stateFrom(ctx context.Context) (*requestState, error) {
@@ -435,6 +534,40 @@ func stateFrom(ctx context.Context) (*requestState, error) {
 		return nil, errors.New("gfast: no request in context")
 	}
 	return st, nil
+}
+
+// RequestFrom returns the *http.Request for this handler context.
+// It panics if ctx is not a gfast request.
+func RequestFrom(ctx context.Context) *http.Request {
+	st, err := stateFrom(ctx)
+	if err != nil {
+		panic("gfast.RequestFrom: " + err.Error())
+	}
+	return st.req
+}
+
+// StateFrom returns the mutable app state map.
+// OnStart and OnStop receive it on their context. Handlers read the same map.
+// It panics if ctx did not come from a gfast request or from those hooks.
+// The map is not safe for concurrent writes.
+func StateFrom(ctx context.Context) map[string]any {
+	if ctx != nil {
+		if m, ok := ctx.Value(appStateKey{}).(map[string]any); ok && m != nil {
+			return m
+		}
+	}
+	panic("gfast.StateFrom: no app state in context")
+}
+
+// State returns the mutable app state map.
+// OnStart hooks and handlers share this map. See StateFrom.
+// The map is not safe for concurrent writes.
+func (a *App) State() map[string]any {
+	return a.appState
+}
+
+func (a *App) hookContext() context.Context {
+	return context.WithValue(context.Background(), appStateKey{}, a.appState)
 }
 
 // ListenAndServe starts the server. OnStart runs first. OnStop runs when
@@ -516,10 +649,17 @@ func (a *App) boot() error {
 		return errors.New("gfast: server already started")
 	}
 	a.started = true
+	a.mu.Unlock()
+	return a.runStartHooks()
+}
+
+func (a *App) runStartHooks() error {
+	a.mu.Lock()
 	hooks := append([]func(context.Context) error(nil), a.cfg.onStart...)
 	a.mu.Unlock()
+	ctx := a.hookContext()
 	for _, hook := range hooks {
-		if err := hook(context.Background()); err != nil {
+		if err := hook(ctx); err != nil {
 			return err
 		}
 	}
@@ -527,12 +667,17 @@ func (a *App) boot() error {
 }
 
 func (a *App) shutdown() error {
+	return a.stopHooks()
+}
+
+func (a *App) stopHooks() error {
 	a.mu.Lock()
 	hooks := append([]func(context.Context) error(nil), a.cfg.onStop...)
 	a.mu.Unlock()
+	ctx := a.hookContext()
 	var errs []error
 	for _, hook := range hooks {
-		if err := hook(context.Background()); err != nil {
+		if err := hook(ctx); err != nil {
 			errs = append(errs, err)
 		}
 	}

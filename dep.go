@@ -11,6 +11,7 @@ import (
 )
 
 // Dependency is a value produced by Dep, Bearer, Basic, or an API key helper.
+// Optional credential readers are separate dependencies from the required ones.
 type Dependency interface {
 	dependency() *depEntry
 }
@@ -59,12 +60,14 @@ type override struct {
 }
 
 var (
-	regMu       sync.Mutex
-	regByName   = map[string]*depEntry{}
-	regByID     = map[int]*depEntry{}
-	regSeq      int
-	bearerEntry *depEntry
-	basicEntry  *depEntry
+	regMu               sync.Mutex
+	regByName           = map[string]*depEntry{}
+	regByID             = map[int]*depEntry{}
+	regSeq              int
+	bearerEntry         *depEntry
+	bearerOptionalEntry *depEntry
+	basicEntry          *depEntry
+	basicOptionalEntry  *depEntry
 )
 
 var (
@@ -74,7 +77,9 @@ var (
 
 func init() {
 	bearerEntry = addDep("bearerAuth", readBearer, bearerScheme())
+	bearerOptionalEntry = addDep("bearerAuthOptional", readBearerOptional, bearerScheme())
 	basicEntry = addDep("basicAuth", readBasic, basicScheme())
+	basicOptionalEntry = addDep("basicAuthOptional", readBasicOptional, basicScheme())
 }
 
 // Dep registers a provider under name.
@@ -90,12 +95,17 @@ func Dep(name string, fn any) Dependency {
 	return provider{entry: addDep(name, fn, nil)}
 }
 
-func newAPIKey(in, headerName string) Dependency {
+func newAPIKey(in, headerName string, opts []AuthOption) Dependency {
 	if strings.TrimSpace(headerName) == "" {
 		panic("gfast: api key name is empty")
 	}
 	scheme := apiKeyScheme(in, headerName)
-	entry := addDep(scheme.name, readAPIKey(in, headerName), scheme)
+	name := scheme.name
+	optional := authOptional(opts)
+	if optional {
+		name += "_optional"
+	}
+	entry := addDep(name, readAPIKey(in, headerName, optional), scheme)
 	return provider{entry: entry}
 }
 
