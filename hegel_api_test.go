@@ -171,7 +171,7 @@ type hpNeed struct {
 
 func TestPropSliceQueryAndHeader(t *testing.T) {
 	prop(t, func(ht *hegel.T) {
-		qs := hegel.Draw(ht, hegel.Lists(hegel.Text().Alphabet("abc").MaxSize(4)).MaxSize(4))
+		qs := hegel.Draw(ht, hegel.Lists(hegel.Text().Alphabet("ab👍\u0301").MaxSize(4)).MaxSize(4))
 		hs := hegel.Draw(ht, hegel.Lists(hegel.Integers(-30, 30)).MaxSize(4))
 
 		var hits int

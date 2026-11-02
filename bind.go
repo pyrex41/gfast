@@ -284,6 +284,10 @@ func parseForm(r *http.Request, plan inputPlan) error {
 	}
 }
 
+func headerBreak(s string) bool {
+	return strings.ContainsAny(s, "\x00\r\n")
+}
+
 func paramValues(r *http.Request, p paramField) ([]string, bool, error) {
 	switch p.loc {
 	case "path":
@@ -303,6 +307,11 @@ func paramValues(r *http.Request, p paramField) ([]string, bool, error) {
 		if len(vs) == 0 {
 			return nil, false, nil
 		}
+		for _, v := range vs {
+			if headerBreak(v) {
+				return nil, false, BadRequest("invalid header value")
+			}
+		}
 		return vs, true, nil
 	case "cookie":
 		c, err := r.Cookie(p.name)
@@ -311,6 +320,9 @@ func paramValues(r *http.Request, p paramField) ([]string, bool, error) {
 		}
 		if err != nil {
 			return nil, false, err
+		}
+		if headerBreak(c.Value) {
+			return nil, false, BadRequest("invalid cookie value")
 		}
 		return []string{c.Value}, true, nil
 	case "form":

@@ -892,9 +892,8 @@ func TestPropRedirectLimit(t *testing.T) {
 
 func TestPropSessionRoundTrip(t *testing.T) {
 	prop(t, func(ht *hegel.T) {
-		alpha := hegel.Text().Alphabet("abcXYZ019")
-		secret := hegel.Draw(ht, alpha.MinSize(1).MaxSize(8))
-		value := hegel.Draw(ht, alpha.MaxSize(12))
+		secret := hegel.Draw(ht, hegel.Text().Alphabet("abcXYZ019").MinSize(1).MaxSize(8))
+		value := hegel.Draw(ht, hegel.Text().Alphabet("ab👍\u0301XYZ019").MaxSize(12))
 		n := hegel.Draw(ht, hegel.Integers(-5, 20))
 		same := hegel.Draw(ht, hegel.Integers(0, 2))
 		secure := hegel.Draw(ht, hegel.Booleans())

@@ -337,7 +337,7 @@ func TestWebSocketConnFromPanics(t *testing.T) {
 
 func TestPropWebSocketPayloads(t *testing.T) {
 	prop(t, func(ht *hegel.T) {
-		text := hegel.Draw(ht, hegel.Text().MaxSize(24))
+		text := hegel.Draw(ht, hegel.Text().Alphabet("ab👍\u0301").MaxSize(24))
 		raw := hegel.Draw(ht, hegel.Binary(0, 24))
 		limit := len(text)
 		if len(raw) > limit {
@@ -413,7 +413,13 @@ func acceptOf(key string) string {
 	return base64.StdEncoding.EncodeToString(sum[:])
 }
 
-func dialRaw(t *testing.T, base, path, key string, extra http.Header) net.Conn {
+type testFail interface {
+	Helper()
+	Fatal(args ...any)
+	Fatalf(format string, args ...any)
+}
+
+func dialRaw(t testFail, base, path, key string, extra http.Header) net.Conn {
 	t.Helper()
 	conn, err := net.Dial("tcp", hostPort(base))
 	if err != nil {
@@ -514,7 +520,7 @@ type prefixConn struct {
 
 func (c *prefixConn) Read(p []byte) (int, error) { return c.r.Read(p) }
 
-func writeMasked(t *testing.T, conn net.Conn, fin bool, op byte, payload []byte, mask bool) {
+func writeMasked(t testFail, conn net.Conn, fin bool, op byte, payload []byte, mask bool) {
 	t.Helper()
 	var key []byte
 	b1 := byte(len(payload))
@@ -529,7 +535,7 @@ func writeMasked(t *testing.T, conn net.Conn, fin bool, op byte, payload []byte,
 	writeRaw(t, conn, b0, b1, payload, key)
 }
 
-func writeRaw(t *testing.T, conn net.Conn, b0, b1 byte, payload, key []byte) {
+func writeRaw(t testFail, conn net.Conn, b0, b1 byte, payload, key []byte) {
 	t.Helper()
 	var buf bytes.Buffer
 	buf.WriteByte(b0)
@@ -549,7 +555,7 @@ func writeRaw(t *testing.T, conn net.Conn, b0, b1 byte, payload, key []byte) {
 	}
 }
 
-func readUnmasked(t *testing.T, conn net.Conn) (bool, byte, []byte) {
+func readUnmasked(t testFail, conn net.Conn) (bool, byte, []byte) {
 	t.Helper()
 	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	var hdr [2]byte

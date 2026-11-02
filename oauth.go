@@ -53,9 +53,11 @@ type OAuthClient struct {
 // restart drops them. The access-token signing key is created in memory too,
 // so access tokens from before the restart no longer verify.
 //
-// Codes last one minute. Access tokens last one hour. Refresh tokens last
-// 24 hours and are single use. The server does not implement OpenID Connect
-// discovery, dynamic client registration, or the device-code grant.
+// Codes last one minute, access tokens one hour, and refresh tokens 24 hours.
+// Refresh tokens are single use. CodeTTL, AccessTTL, and RefreshTTL override
+// those lifetimes. Zero keeps the default. A negative duration is already
+// expired. The server does not implement OpenID Connect discovery, dynamic
+// client registration, or the device-code grant.
 type OAuthConfig struct {
 	Clients []OAuthClient
 	// Scopes is the OpenAPI catalog. The value is the description.
@@ -68,6 +70,15 @@ type OAuthConfig struct {
 	// Session checks the authorization request and returns the signed-in subject.
 	// An empty subject means there is no session.
 	Session func(ctx context.Context, r *http.Request) (subject string, err error)
+	// CodeTTL is how long an authorization code stays valid.
+	// Zero means one minute.
+	CodeTTL time.Duration
+	// AccessTTL is how long an access token stays valid.
+	// Zero means one hour.
+	AccessTTL time.Duration
+	// RefreshTTL is how long a refresh token stays valid.
+	// Zero means 24 hours.
+	RefreshTTL time.Duration
 }
 
 type oauthServer struct {
@@ -199,12 +210,19 @@ func newOAuthServer(cfg *OAuthConfig) *oauthServer {
 		password:   cfg.Password,
 		session:    cfg.Session,
 		key:        key,
-		codeTTL:    oauthCodeTTL,
-		accessTTL:  oauthAccessTTL,
-		refreshTTL: oauthRefreshTTL,
+		codeTTL:    ttlOr(cfg.CodeTTL, oauthCodeTTL),
+		accessTTL:  ttlOr(cfg.AccessTTL, oauthAccessTTL),
+		refreshTTL: ttlOr(cfg.RefreshTTL, oauthRefreshTTL),
 		codes:      map[string]*authCode{},
 		refreshes:  map[string]*refreshToken{},
 	}
+}
+
+func ttlOr(set, fallback time.Duration) time.Duration {
+	if set == 0 {
+		return fallback
+	}
+	return set
 }
 
 func registerOAuth(mux *http.ServeMux, srv *oauthServer) {

@@ -29,7 +29,7 @@ import (
 
 func prop(t *testing.T, fn func(*hegel.T)) {
 	t.Helper()
-	hegel.Test(t, fn, hegel.WithDatabase(""))
+	hegel.Test(t, fn, hegel.WithDatabase("hegel-db"))
 }
 
 func hpDo(app *gfast.App, method, target string, body []byte, header http.Header, forceCL bool, cl int) *gfast.Result {
@@ -464,12 +464,13 @@ func TestPropScalarBinding(t *testing.T) {
 			hegel.SampledFrom([]string{"NaN", "Inf", "+Inf", "-Inf", "1e309", "0", "1.5"}),
 			hegel.Text().Alphabet("0123456789.+-eE").MinSize(1).MaxSize(12),
 		))
-		wide := hegel.Text().Alphabet("abcXYZ019 _.-~").MaxSize(8)
+		wide := hegel.Text().Alphabet("ab👍\u0301XYZ019._-~").MaxSize(8)
 		qRaws := hegel.Draw(ht, hegel.Lists(wide).MaxSize(3))
 		labelRaws := hegel.Draw(ht, hegel.Lists(wide).MaxSize(3))
-		reqRaws := hegel.Draw(ht, hegel.Lists(wide).MaxSize(3))
-		traceRaws := hegel.Draw(ht, hegel.Lists(wide).MaxSize(3))
-		cookieText := hegel.Text().Alphabet("abcXYZ019_-").MaxSize(8)
+		headerText := hegel.Text().Alphabet("abcXYZ019 _.-~!#$%&'*+=?@^_|~").MaxSize(8)
+		reqRaws := hegel.Draw(ht, hegel.Lists(headerText).MaxSize(3))
+		traceRaws := hegel.Draw(ht, hegel.Lists(headerText).MaxSize(3))
+		cookieText := hegel.Text().Alphabet("abcXYZ019_-.~!#$%&'*+=?@^_|~").MaxSize(8)
 		sessionRaws := hegel.Draw(ht, hegel.Lists(cookieText).MaxSize(3))
 		extraRaws := hegel.Draw(ht, hegel.Lists(cookieText).MaxSize(3))
 		lowerHeader := hegel.Draw(ht, hegel.Booleans())
@@ -1313,7 +1314,7 @@ func TestPropOpenAPIRoutingAndDocs(t *testing.T) {
 		method := methods[methodIndex]
 		other := methods[(methodIndex+1)%len(methods)]
 		id := hegel.Draw(ht, hegel.Integers(0, 999))
-		q := hegel.Draw(ht, hegel.Text().Alphabet("abcXYZ019").MaxSize(8))
+		q := hegel.Draw(ht, hegel.Text().Alphabet("ab👍\u0301XYZ019").MaxSize(8))
 		summary := hegel.Draw(ht, hegel.Text().Alphabet("abc ").MaxSize(12))
 		description := hegel.Draw(ht, hegel.Text().Alphabet("abc ").MaxSize(12))
 
