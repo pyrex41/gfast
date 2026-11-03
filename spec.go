@@ -1,6 +1,7 @@
 package gfast
 
 import (
+	"encoding"
 	"fmt"
 	"io"
 	"net/http"
@@ -101,25 +102,26 @@ type opResp struct {
 }
 
 type docSchema struct {
-	Ref              string                `json:"$ref,omitempty"`
-	Type             string                `json:"type,omitempty"`
-	Format           string                `json:"format,omitempty"`
-	Description      string                `json:"description,omitempty"`
-	Properties       map[string]*docSchema `json:"properties,omitempty"`
-	Required         []string              `json:"required,omitempty"`
-	Items            *docSchema            `json:"items,omitempty"`
-	MinLength        *int                  `json:"minLength,omitempty"`
-	MaxLength        *int                  `json:"maxLength,omitempty"`
-	MinItems         *int                  `json:"minItems,omitempty"`
-	MaxItems         *int                  `json:"maxItems,omitempty"`
-	Minimum          *float64              `json:"minimum,omitempty"`
-	Maximum          *float64              `json:"maximum,omitempty"`
-	ExclusiveMinimum *float64              `json:"exclusiveMinimum,omitempty"`
-	ExclusiveMaximum *float64              `json:"exclusiveMaximum,omitempty"`
-	Pattern          string                `json:"pattern,omitempty"`
-	Enum             []any                 `json:"enum,omitzero"`
-	Default          any                   `json:"default,omitzero"`
-	Example          schemaExample         `json:"example,omitzero"`
+	Ref                  string                `json:"$ref,omitempty"`
+	Type                 string                `json:"type,omitempty"`
+	Format               string                `json:"format,omitempty"`
+	Description          string                `json:"description,omitempty"`
+	Properties           map[string]*docSchema `json:"properties,omitempty"`
+	Required             []string              `json:"required,omitempty"`
+	Items                *docSchema            `json:"items,omitempty"`
+	AdditionalProperties *docSchema            `json:"additionalProperties,omitempty"`
+	MinLength            *int                  `json:"minLength,omitempty"`
+	MaxLength            *int                  `json:"maxLength,omitempty"`
+	MinItems             *int                  `json:"minItems,omitempty"`
+	MaxItems             *int                  `json:"maxItems,omitempty"`
+	Minimum              *float64              `json:"minimum,omitempty"`
+	Maximum              *float64              `json:"maximum,omitempty"`
+	ExclusiveMinimum     *float64              `json:"exclusiveMinimum,omitempty"`
+	ExclusiveMaximum     *float64              `json:"exclusiveMaximum,omitempty"`
+	Pattern              string                `json:"pattern,omitempty"`
+	Enum                 []any                 `json:"enum,omitzero"`
+	Default              any                   `json:"default,omitzero"`
+	Example              schemaExample         `json:"example,omitzero"`
 }
 
 // schemaExample is present even when the example is 0, false, or "".
@@ -323,6 +325,14 @@ func (a *App) schemaForMode(t reflect.Type, topJSON bool) *docSchema {
 	if t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
+	switch {
+	case t == timeType:
+		return &docSchema{Type: "string", Format: "date-time"}
+	case jsonMarshaler(t):
+		return &docSchema{}
+	case textMarshaler(t):
+		return &docSchema{Type: "string"}
+	}
 	switch t.Kind() {
 	case reflect.String:
 		return &docSchema{Type: "string"}
@@ -334,7 +344,12 @@ func (a *App) schemaForMode(t reflect.Type, topJSON bool) *docSchema {
 	case reflect.Float32, reflect.Float64:
 		return &docSchema{Type: "number"}
 	case reflect.Slice, reflect.Array:
+		if byteWire(t) {
+			return &docSchema{Type: "string", Format: "byte"}
+		}
 		return &docSchema{Type: "array", Items: a.schemaFor(t.Elem())}
+	case reflect.Map:
+		return &docSchema{Type: "object", AdditionalProperties: a.schemaFor(t.Elem())}
 	case reflect.Struct:
 		if t.Name() != "" {
 			return a.refStruct(t, topJSON)
@@ -412,44 +427,188 @@ func (a *App) structSchema(t reflect.Type, topJSON bool) *docSchema {
 	}
 	props := map[string]*docSchema{}
 	var required []string
-	for i := 0; i < t.NumField(); i++ {
-		f := t.Field(i)
-		if f.PkgPath != "" && !f.Anonymous {
-			continue
+	for _, field := range jsonFields(t, topJSON) {
+		prop := a.schemaFor(field.typ)
+		decorateSchema(prop, field.tag, field.typ)
+		props[field.name] = prop
+		// omitempty and omitzero are optional. required:"true" stays required
+		// even when the json tag also omits the zero value.
+		if field.tag.Get("required") == "true" || (!field.omitempty && !field.omitzero) {
+			required = append(required, field.name)
 		}
-		if f.Name == "Body" || f.Name == "RawBody" {
-			continue
-		}
-		if _, ok := depTag(f); ok {
-			continue
-		}
-		if _, _, ok := paramTag(f); ok {
-			continue
-		}
-		if topJSON && f.Anonymous && f.Tag.Get("json") == "" {
-			nested := a.structSchema(f.Type, true)
-			if nested == nil {
-				continue
-			}
-			for name, prop := range nested.Properties {
-				props[name] = prop
-			}
-			required = append(required, nested.Required...)
-			continue
-		}
-		if topJSON && !isJSONField(f) {
-			continue
-		}
-		name := jsonName(f)
-		if name == "-" || name == "" {
-			continue
-		}
-		prop := a.schemaFor(f.Type)
-		decorateSchema(prop, f.Tag, f.Type)
-		props[name] = prop
-		required = append(required, name)
 	}
 	return &docSchema{Type: "object", Properties: props, Required: required}
+}
+
+// jsonField is one JSON object member. Depth is the embed depth.
+// On a handler input (top), Body and RawBody are transport fields, not members.
+type jsonField struct {
+	name      string
+	typ       reflect.Type
+	tag       reflect.StructTag
+	omitempty bool
+	omitzero  bool
+	explicit  bool
+	depth     int
+}
+
+func jsonFields(t reflect.Type, top bool) []jsonField {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t.Kind() != reflect.Struct || scalarWire(t) {
+		return nil
+	}
+	var out []jsonField
+	index := map[string]int{}
+	var walk func(reflect.Type, bool, int, map[reflect.Type]struct{})
+	walk = func(t reflect.Type, top bool, depth int, seen map[reflect.Type]struct{}) {
+		for t.Kind() == reflect.Pointer {
+			t = t.Elem()
+		}
+		if t.Kind() != reflect.Struct || scalarWire(t) {
+			return
+		}
+		if _, ok := seen[t]; ok {
+			return
+		}
+		seen[t] = struct{}{}
+		defer delete(seen, t)
+		for i := 0; i < t.NumField(); i++ {
+			f := t.Field(i)
+			if f.PkgPath != "" && !f.Anonymous {
+				continue
+			}
+			if top && (f.Name == "Body" || f.Name == "RawBody") {
+				continue
+			}
+			if _, ok := depTag(f); ok {
+				continue
+			}
+			if _, _, ok := paramTag(f); ok {
+				continue
+			}
+			info := jsonTagOf(f)
+			if info.skip {
+				continue
+			}
+			if flattenJSON(f, info, top) {
+				walk(f.Type, top, depth+1, seen)
+				continue
+			}
+			if top && !isJSONField(f) {
+				continue
+			}
+			if !f.IsExported() || info.name == "" {
+				continue
+			}
+			next := jsonField{
+				name: info.name, typ: f.Type, tag: f.Tag,
+				omitempty: info.omitempty, omitzero: info.omitzero,
+				explicit: info.explicit, depth: depth,
+			}
+			if at, ok := index[next.name]; ok {
+				if !jsonFieldWins(next, out[at]) {
+					continue
+				}
+				out[at] = next
+				continue
+			}
+			index[next.name] = len(out)
+			out = append(out, next)
+		}
+	}
+	walk(t, top, 0, map[reflect.Type]struct{}{})
+	return out
+}
+
+func jsonFieldWins(next, prev jsonField) bool {
+	if next.depth != prev.depth {
+		return next.depth < prev.depth
+	}
+	return next.explicit && !prev.explicit
+}
+
+type jsonTag struct {
+	name      string
+	explicit  bool
+	omitempty bool
+	omitzero  bool
+	skip      bool
+}
+
+func jsonTagOf(f reflect.StructField) jsonTag {
+	tag, ok := f.Tag.Lookup("json")
+	if !ok {
+		return jsonTag{name: f.Name}
+	}
+	name, opt, _ := strings.Cut(tag, ",")
+	if name == "-" {
+		return jsonTag{skip: true}
+	}
+	out := jsonTag{explicit: name != ""}
+	if name == "" {
+		name = f.Name
+	}
+	out.name = name
+	for _, part := range strings.Split(opt, ",") {
+		switch part {
+		case "omitempty":
+			out.omitempty = true
+		case "omitzero":
+			out.omitzero = true
+		}
+	}
+	return out
+}
+
+func flattenJSON(f reflect.StructField, info jsonTag, top bool) bool {
+	if info.explicit {
+		return false
+	}
+	if top {
+		if !f.Anonymous || f.Tag.Get("json") != "" {
+			return false
+		}
+	} else if !f.Anonymous {
+		return false
+	}
+	ft := f.Type
+	for ft.Kind() == reflect.Pointer {
+		ft = ft.Elem()
+	}
+	return ft.Kind() == reflect.Struct && !scalarWire(ft)
+}
+
+func scalarWire(t reflect.Type) bool {
+	return t == timeType || t == fileHeaderType || jsonMarshaler(t) || textMarshaler(t)
+}
+
+func byteWire(t reflect.Type) bool {
+	if t.Kind() != reflect.Slice && t.Kind() != reflect.Array {
+		return false
+	}
+	elem := t.Elem()
+	return elem.Kind() == reflect.Uint8 && elem.PkgPath() == ""
+}
+
+var (
+	jsonMarshalerType   = reflect.TypeFor[jsonv2.Marshaler]()
+	jsonMarshalerToType = reflect.TypeFor[jsonv2.MarshalerTo]()
+	textMarshalerType   = reflect.TypeFor[encoding.TextMarshaler]()
+	textAppenderType    = reflect.TypeFor[encoding.TextAppender]()
+)
+
+func jsonMarshaler(t reflect.Type) bool {
+	return implementsIface(t, jsonMarshalerType) || implementsIface(t, jsonMarshalerToType)
+}
+
+func textMarshaler(t reflect.Type) bool {
+	return implementsIface(t, textMarshalerType) || implementsIface(t, textAppenderType)
+}
+
+func implementsIface(t, iface reflect.Type) bool {
+	return t != nil && (t.Implements(iface) || reflect.PointerTo(t).Implements(iface))
 }
 
 func (a *App) paramSchema(p paramField) *docSchema {

@@ -138,28 +138,51 @@ func withGzip(level int, next http.Handler) http.Handler {
 	})
 }
 
+// acceptsGzip reports whether Accept-Encoding selects gzip.
+//
+// An explicit gzip coding wins over "*". gzip;q=0 does not compress, even
+// when the wildcard quality is higher. A lone "*" may still select gzip.
+// Duplicate gzip tokens select gzip when any explicit quality is greater
+// than zero; a zero does not cancel a positive sibling, and any explicit
+// gzip token blocks the wildcard. Duplicate wildcards are used only when
+// gzip is absent, and any positive wildcard quality selects gzip.
+// A missing q means 1. The first q parameter on a coding wins. q is parsed
+// with strconv.ParseFloat after the parameter is trimmed and lowercased.
+// Values above 1 count as 1. Values below 0, or values that do not parse,
+// count as 0 and still mark an explicit coding. Names are case-insensitive.
+// A missing or empty header does not select gzip.
 func acceptsGzip(header string) bool {
-	best := 0.0
+	seenGzip := false
+	gzipOK := false
+	starOK := false
 	for _, part := range strings.Split(header, ",") {
 		part = strings.TrimSpace(part)
 		if part == "" {
 			continue
 		}
 		name := part
-		q := 1.0
+		params := ""
 		if i := strings.Index(part, ";"); i >= 0 {
 			name = strings.TrimSpace(part[:i])
-			q = codingQuality(part[i+1:])
+			params = part[i+1:]
 		}
-		name = strings.ToLower(name)
-		if name != "gzip" && name != "*" {
-			continue
-		}
-		if q > best {
-			best = q
+		q := codingQuality(params)
+		switch strings.ToLower(name) {
+		case "gzip":
+			seenGzip = true
+			if q > 0 {
+				gzipOK = true
+			}
+		case "*":
+			if q > 0 {
+				starOK = true
+			}
 		}
 	}
-	return best > 0
+	if seenGzip {
+		return gzipOK
+	}
+	return starOK
 }
 
 func codingQuality(param string) float64 {

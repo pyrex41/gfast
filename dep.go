@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"unicode"
+	"unsafe"
 )
 
 // Dependency is a value produced by Dep, Bearer, Basic, or an API key helper.
@@ -105,15 +106,23 @@ func newAPIKey(in, headerName string, opts []AuthOption) Dependency {
 	if optional {
 		name += "_optional"
 	}
-	entry := addDep(name, readAPIKey(in, headerName, optional), scheme)
+	// Same location, name, and options are the reader already stored under
+	// name. A different provider under that name still panics.
+	entry := insertDep(name, reflect.ValueOf(readAPIKey(in, headerName, optional)), scheme, true)
 	return provider{entry: entry}
 }
 
 func addDep(name string, fn any, scheme *namedScheme) *depEntry {
-	v := reflect.ValueOf(fn)
+	return insertDep(name, reflect.ValueOf(fn), scheme, false)
+}
+
+func insertDep(name string, v reflect.Value, scheme *namedScheme, reuse bool) *depEntry {
 	regMu.Lock()
 	defer regMu.Unlock()
-	if _, ok := regByName[name]; ok {
+	if e, ok := regByName[name]; ok {
+		if reuse && sameAPIKey(e, scheme) {
+			return e
+		}
 		panic("gfast: duplicate dependency " + name)
 	}
 	regSeq++
@@ -127,6 +136,20 @@ func addDep(name string, fn any, scheme *namedScheme) *depEntry {
 	regByName[name] = e
 	regByID[e.id] = e
 	return e
+}
+
+// sameAPIKey reports whether e is the reader described by scheme.
+// A sanitized name collision has a different param and must not match.
+func sameAPIKey(e *depEntry, scheme *namedScheme) bool {
+	if e == nil || e.scheme == nil || scheme == nil {
+		return false
+	}
+	return e.scheme.typ == scheme.typ &&
+		e.scheme.scheme == scheme.scheme &&
+		e.scheme.in == scheme.in &&
+		e.scheme.param == scheme.param &&
+		e.scheme.name == scheme.name &&
+		e.scheme.description == scheme.description
 }
 
 func validateFn(name string, v reflect.Value, want reflect.Type) {
@@ -239,17 +262,24 @@ func collectDepFields(t reflect.Type) []depField {
 		t = t.Elem()
 	}
 	var fields []depField
-	walkDepFields(t, nil, &fields)
+	walkDepFields(t, nil, &fields, map[reflect.Type]struct{}{})
 	return fields
 }
 
-func walkDepFields(t reflect.Type, prefix []int, fields *[]depField) {
+func walkDepFields(t reflect.Type, prefix []int, fields *[]depField, active map[reflect.Type]struct{}) {
 	if t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
-	if t.Kind() != reflect.Struct {
+	if t.Kind() != reflect.Struct || t == timeType || t == fileHeaderType {
 		return
 	}
+	// active is the path currently being walked. A repeat is a cycle.
+	// A type used again after this call returns is a separate branch.
+	if _, seen := active[t]; seen {
+		panic("gfast: recursive type " + t.String())
+	}
+	active[t] = struct{}{}
+	defer delete(active, t)
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
 		if f.Name == "Body" || f.Name == "RawBody" {
@@ -274,8 +304,8 @@ func walkDepFields(t reflect.Type, prefix []int, fields *[]depField) {
 		if ft.Kind() == reflect.Pointer {
 			ft = ft.Elem()
 		}
-		if ft.Kind() == reflect.Struct && ft.String() != "time.Time" {
-			walkDepFields(f.Type, index, fields)
+		if ft.Kind() == reflect.Struct && ft != timeType && ft != fileHeaderType {
+			walkDepFields(f.Type, index, fields, active)
 		}
 	}
 }
@@ -339,13 +369,27 @@ func fieldByIndexAlloc(v reflect.Value, index []int) reflect.Value {
 	for _, i := range index {
 		for v.Kind() == reflect.Pointer {
 			if v.IsNil() {
-				v.Set(reflect.New(v.Type().Elem()))
+				setField(v, reflect.New(v.Type().Elem()))
 			}
 			v = v.Elem()
 		}
 		v = v.Field(i)
 	}
 	return v
+}
+
+// setField writes val into field. An anonymous embed of an unexported type is
+// addressable but not settable here. NewAt reaches that pointer so exported
+// fields inside it can be filled.
+func setField(field, val reflect.Value) {
+	if field.CanSet() {
+		field.Set(val)
+		return
+	}
+	if !field.CanAddr() {
+		panic("gfast: cannot set field")
+	}
+	reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem().Set(val)
 }
 
 func callDep(ctx context.Context, e *depEntry) (reflect.Value, error) {

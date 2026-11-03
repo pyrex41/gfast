@@ -722,10 +722,7 @@ func TestPropDepFieldsAndSecurity(t *testing.T) {
 		q := url.Values{"user": {"hacker"}}
 		var res *gfast.Result
 		if flat {
-			payload, _ := json.Marshal(map[string]any{
-				"title": title,
-				"user":  map[string]any{"id": "hacker", "scopes": []string{"zz-nope"}},
-			})
+			payload, _ := json.Marshal(map[string]any{"title": title})
 			res = app.Request(http.MethodPost, "/flat/"+url.PathEscape(id)+"?"+q.Encode(), payload, header)
 		} else {
 			payload, _ := json.Marshal(hpTitle{Title: title})

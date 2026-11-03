@@ -1,6 +1,7 @@
 package gfast
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -11,12 +12,14 @@ import (
 	"net/url"
 	"reflect"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
 
+	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
 )
 
@@ -30,6 +33,7 @@ type inputPlan struct {
 	allowExtra bool
 	hasForm    bool
 	hasFile    bool
+	shape      *objShape
 }
 
 type paramField struct {
@@ -39,6 +43,10 @@ type paramField struct {
 	typ   reflect.Type
 	tag   reflect.StructTag
 }
+
+// maxMultipartMemory is how much of a multipart body stays in memory before
+// a file part spills to disk. The total body cap is MaxBodyBytes.
+const maxMultipartMemory = 32 << 20
 
 var (
 	fileHeaderType = reflect.TypeFor[multipart.FileHeader]()
@@ -57,10 +65,11 @@ func planInput(t reflect.Type) inputPlan {
 	}
 	walkTags(t, 0)
 	var plan inputPlan
-	walkInput(t, nil, &plan)
+	walkInput(t, nil, &plan, map[reflect.Type]struct{}{})
 	if !plan.hasBody && hasJSONFields(t) {
 		plan.flat = true
 		plan.allowExtra = typeAllowsExtra(t)
+		plan.shape = buildShape(t, true, nil)
 	}
 	if (plan.hasBody || plan.flat) && (plan.hasForm || plan.hasFile) {
 		panic("gfast: JSON body and form or file fields cannot share one request")
@@ -68,13 +77,20 @@ func planInput(t reflect.Type) inputPlan {
 	return plan
 }
 
-func walkInput(t reflect.Type, prefix []int, plan *inputPlan) {
+func walkInput(t reflect.Type, prefix []int, plan *inputPlan, active map[reflect.Type]struct{}) {
 	if t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
-	if t.Kind() != reflect.Struct {
+	if t.Kind() != reflect.Struct || t == timeType || t == fileHeaderType {
 		return
 	}
+	// active is the path currently being walked. A repeat is a cycle.
+	// A type used again after this call returns is a separate branch.
+	if _, seen := active[t]; seen {
+		panic("gfast: recursive type " + t.String())
+	}
+	active[t] = struct{}{}
+	defer delete(active, t)
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
 		if f.Name == "RawBody" {
@@ -110,7 +126,7 @@ func walkInput(t reflect.Type, prefix []int, plan *inputPlan) {
 			ft = ft.Elem()
 		}
 		if ft.Kind() == reflect.Struct && ft != timeType && ft != fileHeaderType {
-			walkInput(f.Type, index, plan)
+			walkInput(f.Type, index, plan, active)
 		}
 	}
 }
@@ -268,13 +284,13 @@ func parseForm(r *http.Request, plan inputPlan) error {
 	}
 	switch {
 	case strings.HasPrefix(media, "multipart/"):
-		if err := r.ParseMultipartForm(32 << 20); err != nil {
-			return BadRequest(err.Error())
+		if err := r.ParseMultipartForm(maxMultipartMemory); err != nil {
+			return bodyReadErr(err)
 		}
 		return nil
 	case media == "application/x-www-form-urlencoded":
 		if err := r.ParseForm(); err != nil {
-			return BadRequest(err.Error())
+			return bodyReadErr(err)
 		}
 		return nil
 	case r.Body == nil || r.ContentLength == 0:
@@ -338,7 +354,7 @@ func paramValues(r *http.Request, p paramField) ([]string, bool, error) {
 
 func assignValues(field reflect.Value, vals []string) error {
 	if field.Kind() == reflect.Pointer && field.Type().Elem().Kind() == reflect.Slice {
-		field.Set(reflect.New(field.Type().Elem()))
+		setField(field, reflect.New(field.Type().Elem()))
 		field = field.Elem()
 	}
 	if field.Kind() == reflect.Slice {
@@ -419,29 +435,523 @@ func setFile(field reflect.Value, hs []*multipart.FileHeader) error {
 }
 
 func bindJSON(r *http.Request, dst reflect.Value, plan inputPlan) error {
-	if r.Body == nil || r.ContentLength == 0 {
-		return nil
+	raw, err := readJSONBody(r)
+	if err != nil {
+		return err
 	}
-	var target any
+	if len(raw) != 0 {
+		if err := decodeJSON(raw, dst, plan); err != nil {
+			return err
+		}
+	}
+	typ := dst.Type()
+	top := true
 	if plan.hasBody {
-		field := fieldByIndexAlloc(dst, plan.body)
-		target = field.Addr().Interface()
-	} else {
-		target = dst.Addr().Interface()
+		typ = plan.bodyType
+		top = false
 	}
+	// required:"true" is key presence. A present zero or null is not missing,
+	// and an empty body or {} does not count as those keys.
+	if issues := jsonPresence(raw, typ, top, []string{"body"}); len(issues) > 0 {
+		return invalid(issues)
+	}
+	return nil
+}
+
+func readJSONBody(r *http.Request) ([]byte, error) {
+	if r.Body == nil || r.ContentLength == 0 {
+		return nil, nil
+	}
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil, bodyReadErr(err)
+	}
+	return raw, nil
+}
+
+func decodeJSON(raw []byte, dst reflect.Value, plan inputPlan) error {
 	var opts []jsonv2.Options
 	if !plan.allowExtra {
 		opts = append(opts, jsonv2.RejectUnknownMembers(true))
 	}
-	if err := jsonv2.UnmarshalRead(r.Body, target, opts...); err != nil && err != io.EOF {
+	// A Body field is the whole JSON value. Flat JSON decodes only JSON-owned
+	// fields, and a key that names another source is rejected below.
+	if plan.hasBody || plan.shape == nil || !plan.shape.impure {
+		var target any
+		if plan.hasBody {
+			field := fieldByIndexAlloc(dst, plan.body)
+			target = field.Addr().Interface()
+		} else {
+			target = dst.Addr().Interface()
+		}
+		if err := jsonv2.Unmarshal(raw, target, opts...); err != nil {
+			return BadRequest(err.Error())
+		}
+		return nil
+	}
+	var val jsontext.Value
+	if err := jsonv2.Unmarshal(raw, &val); err != nil {
+		return BadRequest(err.Error())
+	}
+	return decodeOwned(val, dst, plan.shape, opts, []string{"body"})
+}
+
+func jsonPresence(raw []byte, typ reflect.Type, top bool, loc []string) []fieldIssue {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return missingRequired(typ, top, loc)
+	}
+	return presenceValue(raw, typ, top, loc)
+}
+
+func missingRequired(typ reflect.Type, top bool, loc []string) []fieldIssue {
+	for typ.Kind() == reflect.Pointer {
+		typ = typ.Elem()
+	}
+	if typ.Kind() != reflect.Struct || scalarWire(typ) {
+		return nil
+	}
+	var issues []fieldIssue
+	for _, field := range jsonFields(typ, top) {
+		if field.tag.Get("required") == "true" {
+			issues = append(issues, missingJSON(loc, field.name))
+		}
+	}
+	return issues
+}
+
+func missingJSON(loc []string, name string) fieldIssue {
+	return fieldIssue{Loc: appendLoc(loc, name), Type: "missing", Msg: name + " is required"}
+}
+
+func presenceValue(raw []byte, typ reflect.Type, top bool, loc []string) []fieldIssue {
+	trimmed := bytes.TrimSpace(raw)
+	for typ.Kind() == reflect.Pointer {
+		if bytes.Equal(trimmed, []byte("null")) {
+			return nil
+		}
+		typ = typ.Elem()
+	}
+	if scalarWire(typ) || byteWire(typ) {
+		return nil
+	}
+	switch typ.Kind() {
+	case reflect.Struct:
+		members, ok := jsonObjectMembers(trimmed)
+		if !ok {
+			return nil
+		}
+		var issues []fieldIssue
+		for _, field := range jsonFields(typ, top) {
+			val, present := members[field.name]
+			if !present {
+				if field.tag.Get("required") == "true" {
+					issues = append(issues, missingJSON(loc, field.name))
+				}
+				continue
+			}
+			if bytes.Equal(bytes.TrimSpace(val), []byte("null")) {
+				continue
+			}
+			issues = append(issues, presenceValue(val, field.typ, false, appendLoc(loc, field.name))...)
+		}
+		return issues
+	case reflect.Slice, reflect.Array:
+		return presenceSlice(trimmed, typ, loc)
+	case reflect.Map:
+		return presenceMap(trimmed, typ, loc)
+	default:
+		return nil
+	}
+}
+
+func presenceSlice(raw []byte, typ reflect.Type, loc []string) []fieldIssue {
+	vals, ok := jsonArrayValues(raw)
+	if !ok {
+		return nil
+	}
+	var issues []fieldIssue
+	for i, val := range vals {
+		issues = append(issues, presenceValue(val, typ.Elem(), false, appendLoc(loc, strconv.Itoa(i)))...)
+	}
+	return issues
+}
+
+func presenceMap(raw []byte, typ reflect.Type, loc []string) []fieldIssue {
+	members, ok := jsonObjectMembers(raw)
+	if !ok {
+		return nil
+	}
+	keys := make([]string, 0, len(members))
+	for key := range members {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var issues []fieldIssue
+	for _, key := range keys {
+		issues = append(issues, presenceValue(members[key], typ.Elem(), false, appendLoc(loc, key))...)
+	}
+	return issues
+}
+
+func jsonObjectMembers(raw []byte) (map[string]jsontext.Value, bool) {
+	dec := jsontext.NewDecoder(bytes.NewReader(bytes.TrimSpace(raw)))
+	tok, err := dec.ReadToken()
+	if err != nil || tok.Kind() != '{' {
+		return nil, false
+	}
+	members := map[string]jsontext.Value{}
+	for dec.PeekKind() != '}' {
+		key, err := dec.ReadToken()
+		if err != nil {
+			return nil, false
+		}
+		name := strings.Clone(key.String())
+		val, err := dec.ReadValue()
+		if err != nil {
+			return nil, false
+		}
+		members[name] = bytes.Clone(val)
+	}
+	if _, err := dec.ReadToken(); err != nil {
+		return nil, false
+	}
+	return members, true
+}
+
+func jsonArrayValues(raw []byte) ([]jsontext.Value, bool) {
+	dec := jsontext.NewDecoder(bytes.NewReader(bytes.TrimSpace(raw)))
+	tok, err := dec.ReadToken()
+	if err != nil || tok.Kind() != '[' {
+		return nil, false
+	}
+	var vals []jsontext.Value
+	for dec.PeekKind() != ']' {
+		val, err := dec.ReadValue()
+		if err != nil {
+			return nil, false
+		}
+		vals = append(vals, bytes.Clone(val))
+	}
+	if _, err := dec.ReadToken(); err != nil {
+		return nil, false
+	}
+	return vals, true
+}
+
+// objShape is the JSON object ownership for one struct.
+// Reserved names belong to path, query, header, cookie, form, file, or dependency fields.
+type objShape struct {
+	byName    map[string]jsonSlot
+	reserved  map[string]string
+	ambiguous map[string]struct{}
+	impure    bool
+}
+
+type jsonSlot struct {
+	index  []int
+	nested *objShape
+	holder reflect.Type
+}
+
+type shapeCand struct {
+	name  string
+	depth int
+	kind  string
+	slot  jsonSlot
+}
+
+func buildShape(t reflect.Type, top bool, active map[reflect.Type]struct{}) *objShape {
+	if active == nil {
+		active = map[reflect.Type]struct{}{}
+	}
+	var cands []shapeCand
+	walkShape(t, nil, 0, top, &cands, active)
+	return shapeFrom(cands)
+}
+
+func walkShape(t reflect.Type, prefix []int, depth int, top bool, cands *[]shapeCand, active map[reflect.Type]struct{}) {
+	if t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t.Kind() != reflect.Struct || t == timeType || t == fileHeaderType {
+		return
+	}
+	if _, seen := active[t]; seen {
+		panic("gfast: recursive type " + t.String())
+	}
+	active[t] = struct{}{}
+	defer delete(active, t)
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if f.PkgPath != "" && !f.Anonymous {
+			continue
+		}
+		if f.Name == "RawBody" || f.Name == "Body" {
+			continue
+		}
+		index := append(append([]int{}, prefix...), i)
+		if _, ok := depTag(f); ok {
+			if name, ok := reservedName(f); ok {
+				*cands = append(*cands, shapeCand{name: name, depth: depth, kind: "dependency"})
+			}
+			continue
+		}
+		if loc, _, ok := paramTag(f); ok {
+			if name, ok := reservedName(f); ok {
+				*cands = append(*cands, shapeCand{name: name, depth: depth, kind: loc})
+			}
+			continue
+		}
+		ft := f.Type
+		if ft.Kind() == reflect.Pointer {
+			ft = ft.Elem()
+		}
+		if f.Anonymous && f.Tag.Get("json") == "" && ft.Kind() == reflect.Struct && ft != timeType && ft != fileHeaderType {
+			walkShape(f.Type, index, depth+1, top, cands, active)
+			continue
+		}
+		name, ok := ownedName(f, top)
+		if !ok {
+			continue
+		}
+		slot := jsonSlot{index: index}
+		if ft.Kind() == reflect.Struct && ft != timeType && ft != fileHeaderType {
+			nested := buildShape(ft, false, active)
+			if nested.impure {
+				slot.nested = nested
+			}
+		}
+		if slot.nested == nil {
+			slot.holder = jsonHolder(f.Type, name, jsonOpts(f))
+		}
+		*cands = append(*cands, shapeCand{name: name, depth: depth, kind: "json", slot: slot})
+	}
+}
+
+func shapeFrom(cands []shapeCand) *objShape {
+	shape := &objShape{
+		byName:    map[string]jsonSlot{},
+		reserved:  map[string]string{},
+		ambiguous: map[string]struct{}{},
+	}
+	byName := map[string][]shapeCand{}
+	for _, cand := range cands {
+		byName[cand.name] = append(byName[cand.name], cand)
+	}
+	for name, group := range byName {
+		min := group[0].depth
+		for _, cand := range group[1:] {
+			if cand.depth < min {
+				min = cand.depth
+			}
+		}
+		var won []shapeCand
+		for _, cand := range group {
+			if cand.depth == min {
+				won = append(won, cand)
+			}
+		}
+		kind := ""
+		var jsons []shapeCand
+		for _, cand := range won {
+			if cand.kind != "json" {
+				kind = cand.kind
+				continue
+			}
+			jsons = append(jsons, cand)
+		}
+		switch {
+		case kind != "":
+			shape.reserved[name] = kind
+			shape.impure = true
+		case len(jsons) > 1:
+			shape.ambiguous[name] = struct{}{}
+			shape.impure = true
+		default:
+			shape.byName[name] = jsons[0].slot
+			if jsons[0].slot.nested != nil {
+				shape.impure = true
+			}
+		}
+	}
+	return shape
+}
+
+func reservedName(f reflect.StructField) (string, bool) {
+	tag, has := f.Tag.Lookup("json")
+	if !has {
+		return f.Name, true
+	}
+	name, _, _ := strings.Cut(tag, ",")
+	if name == "-" {
+		return "", false
+	}
+	if name == "" {
+		name = f.Name
+	}
+	return name, true
+}
+
+func ownedName(f reflect.StructField, top bool) (string, bool) {
+	tag, has := f.Tag.Lookup("json")
+	if !has {
+		if top {
+			return "", false
+		}
+		return f.Name, true
+	}
+	name, _, _ := strings.Cut(tag, ",")
+	if name == "-" {
+		return "", false
+	}
+	if name == "" {
+		name = f.Name
+	}
+	return name, true
+}
+
+func jsonOpts(f reflect.StructField) string {
+	raw, ok := f.Tag.Lookup("json")
+	if !ok {
+		return ""
+	}
+	_, opt, found := strings.Cut(raw, ",")
+	if !found {
+		return ""
+	}
+	return "," + opt
+}
+
+func jsonHolder(typ reflect.Type, name, opts string) reflect.Type {
+	return reflect.StructOf([]reflect.StructField{{
+		Name: "V",
+		Type: typ,
+		Tag:  reflect.StructTag(`json:"` + name + opts + `"`),
+	}})
+}
+
+func decodeOwned(raw jsontext.Value, dst reflect.Value, shape *objShape, opts []jsonv2.Options, loc []string) error {
+	trimmed := bytes.TrimSpace(raw)
+	if bytes.Equal(trimmed, []byte("null")) {
+		zeroOwned(dst, shape)
+		return nil
+	}
+	dec := jsontext.NewDecoder(bytes.NewReader(trimmed))
+	tok, err := dec.ReadToken()
+	if err != nil {
+		return BadRequest(err.Error())
+	}
+	if tok.Kind() != '{' {
+		probe := reflect.New(dst.Type())
+		if err := jsonv2.Unmarshal(trimmed, probe.Interface(), opts...); err != nil {
+			return BadRequest(err.Error())
+		}
+		return BadRequest("json: cannot replace a struct with a non-object")
+	}
+	for dec.PeekKind() != '}' {
+		key, err := dec.ReadToken()
+		if err != nil {
+			return BadRequest(err.Error())
+		}
+		// ReadValue voids the raw key token. Copy the name first.
+		name := strings.Clone(key.String())
+		val, err := dec.ReadValue()
+		if err != nil {
+			return BadRequest(err.Error())
+		}
+		if _, ok := shape.ambiguous[name]; ok {
+			return BadRequest("ambiguous object member name " + strconv.Quote(name))
+		}
+		if kind, ok := shape.reserved[name]; ok {
+			return invalid([]fieldIssue{{
+				Loc:  appendLoc(loc, name),
+				Type: "ownership",
+				Msg:  name + " belongs to " + kind,
+			}})
+		}
+		slot, ok := shape.byName[name]
+		if !ok {
+			if len(opts) > 0 {
+				return BadRequest("unknown object member name " + strconv.Quote(name))
+			}
+			continue
+		}
+		field := fieldByIndexAlloc(dst, slot.index)
+		if slot.nested != nil {
+			if err := decodeNested(field, val, slot.nested, opts, appendLoc(loc, name)); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := assignJSON(field, name, val, slot.holder, opts); err != nil {
+			return err
+		}
+	}
+	if _, err := dec.ReadToken(); err != nil {
 		return BadRequest(err.Error())
 	}
 	return nil
 }
 
+func decodeNested(field reflect.Value, raw jsontext.Value, shape *objShape, opts []jsonv2.Options, loc []string) error {
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		if field.Kind() == reflect.Pointer {
+			field.SetZero()
+			return nil
+		}
+		zeroOwned(field, shape)
+		return nil
+	}
+	if field.Kind() == reflect.Pointer {
+		if field.IsNil() {
+			setField(field, reflect.New(field.Type().Elem()))
+		}
+		field = field.Elem()
+	}
+	return decodeOwned(raw, field, shape, opts, loc)
+}
+
+func zeroOwned(dst reflect.Value, shape *objShape) {
+	for _, slot := range shape.byName {
+		field := fieldByIndexAlloc(dst, slot.index)
+		if slot.nested != nil && field.Kind() != reflect.Pointer {
+			zeroOwned(field, slot.nested)
+			continue
+		}
+		field.SetZero()
+	}
+}
+
+func assignJSON(field reflect.Value, name string, raw jsontext.Value, holder reflect.Type, opts []jsonv2.Options) error {
+	box := reflect.New(holder).Elem()
+	if field.Kind() != reflect.Pointer || !field.IsNil() {
+		box.Field(0).Set(field)
+	}
+	payload := memberJSON(name, raw)
+	if err := jsonv2.Unmarshal(payload, box.Addr().Interface(), opts...); err != nil {
+		return BadRequest(err.Error())
+	}
+	field.Set(box.Field(0))
+	return nil
+}
+
+func memberJSON(name string, raw jsontext.Value) []byte {
+	key, err := jsonv2.Marshal(name)
+	if err != nil {
+		key = []byte(strconv.Quote(name))
+	}
+	buf := make([]byte, 0, len(key)+len(raw)+3)
+	buf = append(buf, '{')
+	buf = append(buf, key...)
+	buf = append(buf, ':')
+	buf = append(buf, raw...)
+	buf = append(buf, '}')
+	return buf
+}
+
 func setScalar(field reflect.Value, raw string) error {
 	if field.Kind() == reflect.Pointer {
-		field.Set(reflect.New(field.Type().Elem()))
+		setField(field, reflect.New(field.Type().Elem()))
 		field = field.Elem()
 	}
 	switch field.Kind() {
@@ -503,7 +1013,7 @@ func applyDefaults(v reflect.Value, depth int) error {
 		}
 		fv := v.Field(i)
 		if fv.Kind() == reflect.Pointer && fv.IsNil() && fv.Type().Elem().Kind() == reflect.Struct && structHasDefault(fv.Type().Elem(), 0) {
-			fv.Set(reflect.New(fv.Type().Elem()))
+			setField(fv, reflect.New(fv.Type().Elem()))
 		}
 		if raw, ok := f.Tag.Lookup("default"); ok && isScalarType(f.Type) {
 			if err := setScalar(fv, raw); err != nil {

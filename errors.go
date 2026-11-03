@@ -1,6 +1,9 @@
 package gfast
 
-import "net/http"
+import (
+	"errors"
+	"net/http"
+)
 
 // StatusError is an error that sets the HTTP response status.
 // The helpers in this file return RFC 9457 problem details.
@@ -33,6 +36,26 @@ func (e *httpError) validationErrors() []fieldIssue { return e.errors }
 
 func statusErr(code int, msg string) error {
 	return &httpError{status: code, detail: msg}
+}
+
+func requestTooLarge() error {
+	return &httpError{
+		status: http.StatusRequestEntityTooLarge,
+		detail: "request body too large",
+		header: http.Header{"Connection": []string{"close"}},
+	}
+}
+
+func tooBig(err error) bool {
+	var max *http.MaxBytesError
+	return err != nil && errors.As(err, &max)
+}
+
+func bodyReadErr(err error) error {
+	if tooBig(err) {
+		return requestTooLarge()
+	}
+	return BadRequest(err.Error())
 }
 
 // BadRequest is a 400.

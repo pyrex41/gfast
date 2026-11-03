@@ -97,8 +97,11 @@ func New(opts ...Option) *App {
 		Webhooks:     copyAnyMap(app.cfg.webhooks),
 	}
 	app.state.app = app
+	// Built-in handlers are registered on the mux, not through routePolicy.
+	// Require and SkipCSRF on New apply to routes, Mount, and Static only.
 	if app.cfg.oauth != nil {
 		app.oauth = newOAuthServer(app.cfg.oauth)
+		app.oauth.maxBody = resolvedMaxBody(app.cfg.maxBody, nil)
 		registerOAuth(app.mux, app.oauth)
 	}
 	if app.cfg.docsOn() {
@@ -133,7 +136,9 @@ func (a *App) Handler() http.Handler {
 func (a *App) isRouter() *routerState { return &a.state }
 
 // Group returns a router with a path prefix. Route options here, including
-// Require, apply to every route registered on the group.
+// Require and SkipCSRF, apply to routes, Mount, and Static registered on
+// the group and on groups nested under it. They do not apply to /docs,
+// /openapi.json, or the OAuth handlers.
 func (a *App) Group(prefix string, opts ...Option) *Group {
 	return a.state.group(prefix, opts...)
 }
@@ -246,23 +251,17 @@ func register[I, O any](st *routerState, method, path string, handler func(conte
 	inType := reflect.TypeOf((*I)(nil)).Elem()
 	outType := reflect.TypeOf((*O)(nil)).Elem()
 	fields := collectDepFields(inType)
-	requires := make([]*depEntry, 0, len(route.requires))
-	for _, dep := range route.requires {
-		requires = append(requires, dep.dependency())
-	}
 	for _, field := range fields {
 		field.dep.bind(nil)
 	}
-	for _, dep := range requires {
-		dep.bind(nil)
-	}
+	policy := policyFrom(&route)
 
 	schemes := map[string]*namedScheme{}
 	seen := map[int]struct{}{}
 	for _, field := range fields {
 		field.dep.collectSchemes(seen, schemes)
 	}
-	for _, dep := range requires {
+	for _, dep := range policy.requires {
 		dep.collectSchemes(seen, schemes)
 	}
 
@@ -272,19 +271,11 @@ func register[I, O any](st *routerState, method, path string, handler func(conte
 	}
 	full := joinPath(st.prefix, path)
 	plan := planInput(inType)
-	scopes := append([]string(nil), route.scopes...)
 	st.app.addOperation(full, method, route, inType, outType, schemes, status)
 
 	h := func(w http.ResponseWriter, r *http.Request) {
-		ctx := r.Context()
-		rst, err := stateFrom(ctx)
-		if err != nil {
-			writeErr(w, err)
-			return
-		}
-		rst.scopes = scopes
-		if err := enforceCSRF(r, route.skipCSRF); err != nil {
-			writeErr(w, err)
+		rst, ok := policy.open(w, r)
+		if !ok {
 			return
 		}
 		in := new(I)
@@ -293,12 +284,10 @@ func register[I, O any](st *routerState, method, path string, handler func(conte
 			writeErr(w, err)
 			return
 		}
-		for _, dep := range requires {
-			if _, err := callDep(ctx, dep); err != nil {
-				writeErr(w, err)
-				return
-			}
+		if !policy.authorize(w, r) {
+			return
 		}
+		ctx := r.Context()
 		for _, field := range fields {
 			val, err := callDep(ctx, field.dep)
 			if err != nil {
@@ -314,6 +303,80 @@ func register[I, O any](st *routerState, method, path string, handler func(conte
 	if method == http.MethodGet {
 		st.app.mux.HandleFunc(http.MethodHead+" "+full, h)
 	}
+}
+
+// routePolicy is the inherited scope list, CSRF flag, body limit, and Require
+// list for one registration. /docs, /openapi.json, and /oauth are not wrapped
+// with it. OAuth uses the app limit on its own handlers.
+type routePolicy struct {
+	scopes   []string
+	skipCSRF bool
+	requires []*depEntry
+	maxBody  *int64
+}
+
+func policyFrom(route *routeConfig) routePolicy {
+	requires := make([]*depEntry, 0, len(route.requires))
+	for _, dep := range route.requires {
+		requires = append(requires, dep.dependency())
+	}
+	for _, dep := range requires {
+		dep.bind(nil)
+	}
+	return routePolicy{
+		scopes:   append([]string(nil), route.scopes...),
+		skipCSRF: route.skipCSRF,
+		requires: requires,
+		maxBody:  route.maxBody,
+	}
+}
+
+// open limits the body, sets scopes, and enforces CSRF. It writes the error
+// and returns false when the request stops here, before Require and before
+// the handler.
+func (p routePolicy) open(w http.ResponseWriter, r *http.Request) (*requestState, bool) {
+	rst, err := stateFrom(r.Context())
+	if err != nil {
+		writeErr(w, err)
+		return nil, false
+	}
+	rst.scopes = p.scopes
+	if err := installBodyLimit(w, r, resolvedMaxBody(rst.app.cfg.maxBody, p.maxBody)); err != nil {
+		writeErr(w, err)
+		return nil, false
+	}
+	if err := enforceCSRF(r, p.skipCSRF); err != nil {
+		writeErr(w, err)
+		return nil, false
+	}
+	return rst, true
+}
+
+// authorize runs Require. A rejecting dependency is written and returns false
+// so the handler does not run. Dependencies already acquired stay on the
+// request and close with it.
+func (p routePolicy) authorize(w http.ResponseWriter, r *http.Request) bool {
+	ctx := r.Context()
+	for _, dep := range p.requires {
+		if _, err := callDep(ctx, dep); err != nil {
+			writeErr(w, err)
+			return false
+		}
+	}
+	return true
+}
+
+// wrap applies open and authorize before next. A rejection does not call next.
+func (p routePolicy) wrap(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := p.open(w, r); !ok {
+			return
+		}
+		if !p.authorize(w, r) {
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func securityRequirement(schemes map[string]*namedScheme, scopes []string) map[string][]string {
@@ -443,6 +506,57 @@ func (a *App) Override(dep Dependency, fn any) {
 	a.mu.Lock()
 	a.overrides[entry.id] = ov
 	a.mu.Unlock()
+}
+
+const defaultMaxBodyBytes int64 = 1 << 20
+
+func resolvedMaxBody(appLimit int64, route *int64) int64 {
+	n := appLimit
+	if route != nil {
+		n = *route
+	}
+	if n == 0 {
+		return defaultMaxBodyBytes
+	}
+	return n
+}
+
+func installBodyLimit(w http.ResponseWriter, r *http.Request, limit int64) error {
+	if r.Body == nil {
+		r.Body = http.NoBody
+	}
+	r.Body = http.MaxBytesReader(unwrapWriter(w), r.Body, limit)
+	if st, err := stateFrom(r.Context()); err == nil {
+		st.closers = append(st.closers, multipartCleanup{r: r})
+	}
+	if r.ContentLength > limit {
+		return requestTooLarge()
+	}
+	return nil
+}
+
+func unwrapWriter(w http.ResponseWriter) http.ResponseWriter {
+	for range 8 {
+		u, ok := w.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			return w
+		}
+		next := u.Unwrap()
+		if next == nil || next == w {
+			return w
+		}
+		w = next
+	}
+	return w
+}
+
+type multipartCleanup struct{ r *http.Request }
+
+func (c multipartCleanup) Close() error {
+	if c.r == nil || c.r.MultipartForm == nil {
+		return nil
+	}
+	return c.r.MultipartForm.RemoveAll()
 }
 
 func (a *App) override(id int) (override, bool) {

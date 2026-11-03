@@ -27,6 +27,10 @@ const (
 	oauthCodeTTL    = time.Minute
 	oauthAccessTTL  = time.Hour
 	oauthRefreshTTL = 24 * time.Hour
+
+	// oauthMaxStored is the cap used when MaxCodes or MaxRefresh is zero.
+	oauthMaxStored = 1024
+	oauthStoreFull = "token storage is full"
 )
 
 // OAuthClient is a client of the in-process authorization server.
@@ -49,15 +53,24 @@ type OAuthClient struct {
 // from the authorization request. Client credentials needs neither.
 // Password and Session are called on requests and must be safe for concurrent use.
 //
-// Authorization codes and refresh tokens are stored in memory. A process
-// restart drops them. The access-token signing key is created in memory too,
-// so access tokens from before the restart no longer verify.
+// Authorization codes and refresh tokens are stored in memory until that
+// token is presented again, including after it expires. Issuing or consuming
+// a code or a refresh token also deletes every expired code and expired
+// refresh token. Nothing evicts a live token, and the server does not run a
+// background sweep. A process restart drops both maps. The access-token
+// signing key is created in memory too, so access tokens from before the
+// restart no longer verify.
+//
+// MaxCodes and MaxRefresh cap the two maps. Zero means 1024. A negative cap
+// panics. After expired entries are removed, a new code or refresh token that
+// would exceed its cap is refused with HTTP 503 and an OAuth server_error.
 //
 // Codes last one minute, access tokens one hour, and refresh tokens 24 hours.
 // Refresh tokens are single use. CodeTTL, AccessTTL, and RefreshTTL override
 // those lifetimes. Zero keeps the default. A negative duration is already
-// expired. The server does not implement OpenID Connect discovery, dynamic
-// client registration, or the device-code grant.
+// expired and is deleted by the next sweep. Now, if set, is the clock for
+// those lifetimes. Nil uses time.Now. The server does not implement OpenID
+// Connect discovery, dynamic client registration, or the device-code grant.
 type OAuthConfig struct {
 	Clients []OAuthClient
 	// Scopes is the OpenAPI catalog. The value is the description.
@@ -71,14 +84,23 @@ type OAuthConfig struct {
 	// An empty subject means there is no session.
 	Session func(ctx context.Context, r *http.Request) (subject string, err error)
 	// CodeTTL is how long an authorization code stays valid.
-	// Zero means one minute.
+	// Zero means one minute. A negative duration is already expired.
 	CodeTTL time.Duration
 	// AccessTTL is how long an access token stays valid.
-	// Zero means one hour.
+	// Zero means one hour. A negative duration is already expired.
 	AccessTTL time.Duration
 	// RefreshTTL is how long a refresh token stays valid.
-	// Zero means 24 hours.
+	// Zero means 24 hours. A negative duration is already expired.
 	RefreshTTL time.Duration
+	// MaxCodes is the most authorization codes kept in memory.
+	// Zero means 1024. A negative value panics.
+	MaxCodes int
+	// MaxRefresh is the most refresh tokens kept in memory.
+	// Zero means 1024. A negative value panics.
+	MaxRefresh int
+	// Now, if set, is the clock for code, refresh, and access-token expiry.
+	// Nil uses time.Now.
+	Now func() time.Time
 }
 
 type oauthServer struct {
@@ -91,11 +113,17 @@ type oauthServer struct {
 	codeTTL    time.Duration
 	accessTTL  time.Duration
 	refreshTTL time.Duration
+	maxCodes   int
+	maxRefresh int
+	clock      func() time.Time
+	maxBody    int64
 
 	mu        sync.Mutex
 	codes     map[string]*authCode
 	refreshes map[string]*refreshToken
 }
+
+var errOAuthStoreFull = errors.New("oauth token storage is full")
 
 type oauthClient struct {
 	id        string
@@ -213,9 +241,22 @@ func newOAuthServer(cfg *OAuthConfig) *oauthServer {
 		codeTTL:    ttlOr(cfg.CodeTTL, oauthCodeTTL),
 		accessTTL:  ttlOr(cfg.AccessTTL, oauthAccessTTL),
 		refreshTTL: ttlOr(cfg.RefreshTTL, oauthRefreshTTL),
+		maxCodes:   oauthStorageCap(cfg.MaxCodes, "MaxCodes"),
+		maxRefresh: oauthStorageCap(cfg.MaxRefresh, "MaxRefresh"),
+		clock:      cfg.Now,
 		codes:      map[string]*authCode{},
 		refreshes:  map[string]*refreshToken{},
 	}
+}
+
+func oauthStorageCap(n int, name string) int {
+	if n < 0 {
+		panic("gfast: oauth " + name + " is negative")
+	}
+	if n == 0 {
+		return oauthMaxStored
+	}
+	return n
 }
 
 func ttlOr(set, fallback time.Duration) time.Duration {
@@ -274,6 +315,10 @@ func (s *oauthServer) securityScheme() secScheme {
 }
 
 func (s *oauthServer) authorize(w http.ResponseWriter, r *http.Request) {
+	if err := installBodyLimit(w, r, s.maxBody); err != nil {
+		writeErr(w, err)
+		return
+	}
 	if r.Method == http.MethodPost {
 		if err := enforceCSRF(r, false); err != nil {
 			writeErr(w, err)
@@ -284,6 +329,10 @@ func (s *oauthServer) authorize(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := r.ParseForm(); err != nil {
+			if tooBig(err) {
+				writeErr(w, requestTooLarge())
+				return
+			}
 			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "invalid form body")
 			return
 		}
@@ -323,10 +372,9 @@ func (s *oauthServer) authorize(w http.ResponseWriter, r *http.Request) {
 		subject:     subject,
 		scopes:      scopes,
 		challenge:   q.Get("code_challenge"),
-		expires:     time.Now().Add(s.codeTTL),
 	})
 	if err != nil {
-		writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not issue code")
+		oauthWriteIssueErr(w, err, "could not issue code")
 		return
 	}
 	target, err := withQuery(redirectURI, url.Values{"code": {raw}, "state": {state}})
@@ -371,6 +419,10 @@ func (s *oauthServer) authorizeUser(w http.ResponseWriter, r *http.Request, redi
 }
 
 func (s *oauthServer) token(w http.ResponseWriter, r *http.Request) {
+	if err := installBodyLimit(w, r, s.maxBody); err != nil {
+		writeErr(w, err)
+		return
+	}
 	if err := enforceCSRF(r, false); err != nil {
 		writeErr(w, err)
 		return
@@ -380,6 +432,10 @@ func (s *oauthServer) token(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := r.ParseForm(); err != nil {
+		if tooBig(err) {
+			writeErr(w, requestTooLarge())
+			return
+		}
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "invalid form body")
 		return
 	}
@@ -488,7 +544,7 @@ func (s *oauthServer) grantPassword(w http.ResponseWriter, r *http.Request, clie
 func (s *oauthServer) writeIssued(w http.ResponseWriter, subject, clientID string, scopes []string, withRefresh bool) {
 	res, err := s.issue(subject, clientID, scopes, withRefresh)
 	if err != nil {
-		writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not issue token")
+		oauthWriteIssueErr(w, err, "could not issue token")
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
@@ -600,23 +656,51 @@ func sortedScopeNames(scopes map[string]string) []string {
 	return names
 }
 
+func (s *oauthServer) now() time.Time {
+	if s.clock != nil {
+		return s.clock()
+	}
+	return time.Now()
+}
+
+// sweepLocked drops expired codes and refresh tokens. The caller holds s.mu.
+// A negative lifetime is already expired, so the next issue or consume deletes it.
+func (s *oauthServer) sweepLocked(now time.Time) {
+	for key, item := range s.codes {
+		if !now.Before(item.expires) {
+			delete(s.codes, key)
+		}
+	}
+	for key, item := range s.refreshes {
+		if !now.Before(item.expires) {
+			delete(s.refreshes, key)
+		}
+	}
+}
+
 func (s *oauthServer) putCode(item *authCode) (string, error) {
 	raw, err := randomToken(32)
 	if err != nil {
 		return "", err
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.now()
+	s.sweepLocked(now)
+	if len(s.codes) >= s.maxCodes {
+		return "", errOAuthStoreFull
+	}
+	item.expires = now.Add(s.codeTTL)
 	s.codes[raw] = item
-	s.mu.Unlock()
 	return raw, nil
 }
 
 func (s *oauthServer) consumeCode(raw, clientID, redirectURI string) *authCode {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.sweepLocked(s.now())
 	item := s.codes[raw]
-	if item == nil || !time.Now().Before(item.expires) {
-		delete(s.codes, raw)
+	if item == nil {
 		return nil
 	}
 	if item.clientID != clientID || item.redirectURI != redirectURI {
@@ -629,9 +713,9 @@ func (s *oauthServer) consumeCode(raw, clientID, redirectURI string) *authCode {
 func (s *oauthServer) consumeRefresh(raw, clientID string) *refreshToken {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.sweepLocked(s.now())
 	item := s.refreshes[raw]
-	if item == nil || !time.Now().Before(item.expires) {
-		delete(s.refreshes, raw)
+	if item == nil {
 		return nil
 	}
 	if item.clientID != clientID {
@@ -642,7 +726,7 @@ func (s *oauthServer) consumeRefresh(raw, clientID string) *refreshToken {
 }
 
 func (s *oauthServer) issue(subject, clientID string, scopes []string, withRefresh bool) (tokenResponse, error) {
-	now := time.Now()
+	now := s.now()
 	jti, err := randomToken(16)
 	if err != nil {
 		return tokenResponse{}, err
@@ -665,6 +749,9 @@ func (s *oauthServer) issue(subject, clientID string, scopes []string, withRefre
 		Scope:       strings.Join(scopes, " "),
 	}
 	if !withRefresh {
+		s.mu.Lock()
+		s.sweepLocked(now)
+		s.mu.Unlock()
 		return res, nil
 	}
 	refresh, err := randomToken(32)
@@ -672,13 +759,17 @@ func (s *oauthServer) issue(subject, clientID string, scopes []string, withRefre
 		return tokenResponse{}, err
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sweepLocked(now)
+	if len(s.refreshes) >= s.maxRefresh {
+		return tokenResponse{}, errOAuthStoreFull
+	}
 	s.refreshes[refresh] = &refreshToken{
 		clientID: clientID,
 		subject:  subject,
 		scopes:   append([]string(nil), scopes...),
 		expires:  now.Add(s.refreshTTL),
 	}
-	s.mu.Unlock()
 	res.RefreshToken = refresh
 	return res, nil
 }
@@ -688,7 +779,7 @@ func (s *oauthServer) accessClaims(raw string) (jwtClaims, error) {
 	if err != nil {
 		return jwtClaims{}, err
 	}
-	if claims.Sub == "" || claims.Exp <= time.Now().Unix() {
+	if claims.Sub == "" || claims.Exp <= s.now().Unix() {
 		return jwtClaims{}, errors.New("invalid token")
 	}
 	return claims, nil
@@ -751,6 +842,16 @@ func parseAccess(key []byte, raw string) (jwtClaims, error) {
 		return jwtClaims{}, errors.New("invalid token")
 	}
 	return claims, nil
+}
+
+func oauthWriteIssueErr(w http.ResponseWriter, err error, fallback string) {
+	status := http.StatusInternalServerError
+	desc := fallback
+	if errors.Is(err, errOAuthStoreFull) {
+		status = http.StatusServiceUnavailable
+		desc = oauthStoreFull
+	}
+	writeOAuthError(w, status, "server_error", desc)
 }
 
 func writeOAuthError(w http.ResponseWriter, status int, code, desc string) {

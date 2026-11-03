@@ -227,39 +227,49 @@ func checkCSRFToken(r *http.Request, st *requestState) error {
 	if csrfEqual(token, header) {
 		return nil
 	}
-	if csrfEqual(token, csrfFormToken(r)) {
+	form, err := csrfFormToken(r)
+	if err != nil {
+		return err
+	}
+	if csrfEqual(token, form) {
 		return nil
 	}
 	return Forbidden(csrfFailed)
 }
 
-func csrfFormToken(r *http.Request) string {
+func csrfFormToken(r *http.Request) (string, error) {
 	if r.PostForm != nil {
 		if v := strings.TrimSpace(r.PostForm.Get(csrfTokenName)); v != "" {
-			return v
+			return v, nil
 		}
 	}
 	media := ""
 	if ct := r.Header.Get("Content-Type"); ct != "" {
 		parsed, _, err := mime.ParseMediaType(ct)
 		if err != nil {
-			return ""
+			return "", nil
 		}
 		media = strings.ToLower(parsed)
 	}
 	switch {
 	case media == "application/x-www-form-urlencoded":
 		if err := r.ParseForm(); err != nil {
-			return ""
+			if tooBig(err) {
+				return "", requestTooLarge()
+			}
+			return "", nil
 		}
 	case strings.HasPrefix(media, "multipart/"):
-		if err := r.ParseMultipartForm(32 << 20); err != nil {
-			return ""
+		if err := r.ParseMultipartForm(maxMultipartMemory); err != nil {
+			if tooBig(err) {
+				return "", requestTooLarge()
+			}
+			return "", nil
 		}
 	default:
-		return ""
+		return "", nil
 	}
-	return strings.TrimSpace(r.PostForm.Get(csrfTokenName))
+	return strings.TrimSpace(r.PostForm.Get(csrfTokenName)), nil
 }
 
 func (s *sessionWriter) writeCSRFCookie() {

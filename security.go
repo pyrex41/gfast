@@ -65,7 +65,8 @@ func authOptional(opts []AuthOption) bool {
 // BearerAuth is the dependency that reads a bearer token.
 // A provider parameter of type Bearer uses the required dependency and marks
 // the route with the bearerAuth security scheme. Optional uses
-// bearerAuthOptional and the same scheme.
+// bearerAuthOptional and the same scheme. The same options return that
+// existing dependency.
 func BearerAuth(opts ...AuthOption) Dependency {
 	if authOptional(opts) {
 		return provider{entry: bearerOptionalEntry}
@@ -74,7 +75,8 @@ func BearerAuth(opts ...AuthOption) Dependency {
 }
 
 // BasicAuth is the dependency that reads HTTP basic credentials.
-// Optional uses the dependency name basicAuthOptional.
+// Optional uses the dependency name basicAuthOptional. The same options
+// return that existing dependency.
 func BasicAuth(opts ...AuthOption) Dependency {
 	if authOptional(opts) {
 		return provider{entry: basicOptionalEntry}
@@ -85,18 +87,21 @@ func BasicAuth(opts ...AuthOption) Dependency {
 // APIKeyHeader returns a dependency that reads an API key from a header.
 // The dependency name is apiKey_header_<name>, with non-alphanumeric
 // characters replaced by underscores. Optional appends _optional.
+// The same name and options return the existing dependency.
 func APIKeyHeader(name string, opts ...AuthOption) Dependency {
 	return newAPIKey("header", name, opts)
 }
 
 // APIKeyQuery returns a dependency that reads an API key from a query parameter.
 // The dependency name is apiKey_query_<name>. Optional appends _optional.
+// The same name and options return the existing dependency.
 func APIKeyQuery(name string, opts ...AuthOption) Dependency {
 	return newAPIKey("query", name, opts)
 }
 
 // APIKeyCookie returns a dependency that reads an API key from a cookie.
 // The dependency name is apiKey_cookie_<name>. Optional appends _optional.
+// The same name and options return the existing dependency.
 func APIKeyCookie(name string, opts ...AuthOption) Dependency {
 	return newAPIKey("cookie", name, opts)
 }

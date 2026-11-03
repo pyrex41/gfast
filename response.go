@@ -265,7 +265,9 @@ func writeChunk(w http.ResponseWriter, p []byte) error {
 	if len(p) == 0 {
 		return nil
 	}
-	if _, err := w.Write(p); err != nil {
+	// Status 204 and 304 make Write return ErrBodyNotAllowed. The test
+	// recorder still stores that chunk, so a later chunk must be written too.
+	if _, err := w.Write(p); err != nil && !errors.Is(err, http.ErrBodyNotAllowed) {
 		return err
 	}
 	if fl, ok := w.(http.Flusher); ok {

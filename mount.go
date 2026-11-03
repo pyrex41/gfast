@@ -11,8 +11,10 @@ import (
 // Mount serves h at prefix and every path under it.
 // The prefix is removed before h runs, and the remaining path starts with a slash.
 // The registration is a ServeMux subtree, a trailing slash, not a {name...} parameter.
-// A request for the prefix without that slash is redirected by ServeMux.
-// gfast does not add a second redirect.
+// A request for the prefix without that slash is redirected by ServeMux before
+// the route policy runs. gfast does not add a second redirect.
+// Require, scopes, and CSRF from the app or group run before h. A rejection
+// does not call h. SkipCSRF on the app or group is honored.
 func (a *App) Mount(prefix string, h http.Handler) {
 	mount(&a.state, prefix, h)
 }
@@ -29,7 +31,9 @@ func Mount(r Router, prefix string, h http.Handler) {
 
 // Static serves files from directory at prefix with the standard file server.
 // GET and HEAD are served. Any other method is 405, with Allow, when the path
-// is inside the prefix. See Mount for stripping and the trailing-slash redirect.
+// is inside the prefix. That 405 is ServeMux's, so the file server and the
+// route policy do not run. GET and HEAD inherit Require, scopes, and CSRF
+// from the app or group. See Mount for stripping and the trailing-slash redirect.
 func (a *App) Static(prefix, directory string) {
 	static(&a.state, prefix, directory)
 }
@@ -49,7 +53,7 @@ func mount(st *routerState, prefix string, h http.Handler) {
 		panic("gfast: Mount got a nil handler")
 	}
 	full := mountPath(st, prefix)
-	st.app.mux.Handle(subtreePattern(full), stripMountPrefix(full, h))
+	st.app.mux.Handle(subtreePattern(full), policyFrom(&st.route).wrap(stripMountPrefix(full, h)))
 }
 
 func static(st *routerState, prefix, directory string) {
@@ -57,8 +61,10 @@ func static(st *routerState, prefix, directory string) {
 		panic("gfast: Static got an empty directory")
 	}
 	full := mountPath(st, prefix)
-	// GET also matches HEAD. Other methods stay on ServeMux's 405 path.
-	st.app.mux.Handle("GET "+subtreePattern(full), stripMountPrefix(full, http.FileServer(http.Dir(directory))))
+	// GET also matches HEAD. Other methods stay on ServeMux's 405 path,
+	// outside the policy wrapper.
+	handler := policyFrom(&st.route).wrap(stripMountPrefix(full, http.FileServer(http.Dir(directory))))
+	st.app.mux.Handle("GET "+subtreePattern(full), handler)
 }
 
 func mountPath(st *routerState, prefix string) string {

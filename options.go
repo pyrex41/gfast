@@ -40,6 +40,8 @@ type appConfig struct {
 	csrfStrict     bool
 	csrfToken      bool
 	csrfOrigins    []string
+	wsOrigins      []string
+	maxBody        int64
 	docs           *bool
 	servers        []Server
 	externalDocs   *externalDoc
@@ -63,6 +65,7 @@ type routeConfig struct {
 	externalDocs *externalDoc
 	callbacks    map[string]any
 	skipCSRF     bool
+	maxBody      *int64
 }
 
 // extraResponse is one extra OpenAPI response collected from Responses.
@@ -228,6 +231,13 @@ func MaxAge(seconds int) Option {
 }
 
 // Gzip compresses responses when the client accepts gzip.
+// An explicit gzip coding wins over "*": gzip;q=0 does not compress even
+// when the wildcard quality is higher, and a lone "*" may still select gzip.
+// Duplicate gzip tokens select gzip when any of them has a positive quality.
+// A missing q means 1. The first q on a coding wins. A q above 1 counts as 1.
+// A negative q, or a q that is not a number, counts as 0 and still marks an
+// explicit gzip coding. Names and q are case-insensitive. A missing
+// Accept-Encoding header does not select gzip.
 // A response that already has a content encoding is not compressed again,
 // and event streams are not compressed. The optional level is a compress/gzip
 // level. App-level.
@@ -513,6 +523,61 @@ func OpenAPIHook(fn func(doc map[string]any)) Option {
 	}
 }
 
+// WebSocketOrigins lists extra hosts that may open a browser WebSocket.
+// A browser Origin is accepted when its host is the request host or one of
+// these hosts. Comparison is case-insensitive, and an explicit port 80 or
+// 443 is the same host as the name with that port omitted. A value may be a
+// host or an absolute http or https URL; only that host is kept. A missing
+// Origin is allowed. null, a malformed Origin, and any other host are
+// rejected with 403 before the connection is hijacked. App-level.
+func WebSocketOrigins(hosts ...string) Option {
+	return func(b *optionBag) {
+		if b.app == nil {
+			return
+		}
+		if len(hosts) == 0 {
+			panic("gfast: WebSocketOrigins requires a host")
+		}
+		for _, host := range hosts {
+			b.app.wsOrigins = append(b.app.wsOrigins, normalizeWSOrigin(host))
+		}
+	}
+}
+
+// MaxBodyBytes limits the request body, in bytes.
+// Zero means 1 MiB. A negative value panics.
+// On New it is the default. On a group or a route it replaces that default,
+// and a group passes the replacement on.
+//
+// A body over the limit is 413 problem+json before the handler runs.
+// Content-Length above the limit is rejected without reading the rest.
+// A shorter non-zero length and a chunked body still stop at the limit:
+// the read ends after at most one extra byte and that body is not parsed.
+// Content-Length 0 stays an empty body and is not read.
+//
+// The cap is applied before JSON binding, form parsing, multipart parsing,
+// CSRF token extraction, and the OAuth authorize and token forms.
+// Multipart's memory argument stays a spill threshold, not this cap.
+// Spill files are removed when the request finishes.
+// Require, including a bearer check that does not read the body, runs only
+// after a body that fits, so an oversized body is 413 rather than a later
+// auth error. One rejected request does not affect the next.
+func MaxBodyBytes(n int) Option {
+	return func(b *optionBag) {
+		if n < 0 {
+			panic("gfast: MaxBodyBytes must not be negative")
+		}
+		if b.app != nil {
+			b.app.maxBody = int64(n)
+			return
+		}
+		if b.route != nil {
+			v := int64(n)
+			b.route.maxBody = &v
+		}
+	}
+}
+
 // MaxMessageSize limits one WebSocket message, in bytes.
 // It applies to WebSocket routes. The default is 1 MiB.
 // A larger frame is closed with code 1009.
@@ -529,8 +594,10 @@ func MaxMessageSize(n int) Option {
 }
 
 // Require runs dependencies before the handler. The values are discarded.
-// A failure aborts the request. Use this for routes that must be authenticated
-// but do not read the user.
+// A failure aborts the request and does not call the handler. Use this for
+// routes that must be authenticated but do not read the user. On New or a
+// group it also covers Mount and Static registered there. It does not cover
+// /docs, /openapi.json, or the OAuth endpoints.
 func Require(deps ...Dependency) Option {
 	return func(b *optionBag) {
 		if b.route == nil {

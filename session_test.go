@@ -3,6 +3,7 @@ package gfast_test
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/pyrex41/gfast"
@@ -54,12 +55,17 @@ func TestSessionRoundTripAndTamper(t *testing.T) {
 		t.Fatalf("unchanged session set cookie %q", got.Header.Get("Set-Cookie"))
 	}
 
-	last := c.Value[len(c.Value)-1]
+	// The last base64 digit can change without changing the decoded HMAC.
+	dot := strings.LastIndexByte(c.Value, '.')
+	if dot < 0 || dot+1 >= len(c.Value) {
+		t.Fatalf("cookie %q", c.Value)
+	}
+	pos := dot + 1
 	repl := byte('A')
-	if last == 'A' {
+	if c.Value[pos] == 'A' {
 		repl = 'B'
 	}
-	tampered := c.Value[:len(c.Value)-1] + string(repl)
+	tampered := c.Value[:pos] + string(repl) + c.Value[pos+1:]
 	for _, raw := range []string{tampered, "nope", "%%%", "abc.def"} {
 		bad := app.Request(http.MethodGet, "/get", nil, http.Header{"Cookie": []string{"session=" + raw}})
 		body = struct {

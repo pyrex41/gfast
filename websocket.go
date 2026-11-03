@@ -26,6 +26,7 @@ const (
 	wsGUID            = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 	defaultMaxMessage = 1 << 20
 	wsVersion         = "13"
+	wsOriginRejected  = "websocket origin rejected"
 
 	opCont   = 0x0
 	opText   = 0x1
@@ -123,6 +124,9 @@ func (e *wsCodeError) Unwrap() error { return e.err }
 // The handler reads and writes with ConnFrom.
 // Path parameters and dependencies run before the upgrade.
 // A failed upgrade is an HTTP error and does not hijack the connection.
+// A browser Origin is accepted only when its host is the request host or a
+// host listed with WebSocketOrigins. A missing Origin is allowed. null, a
+// malformed Origin, and any other host are 403 and do not run the handler.
 func (a *App) WebSocket[I any](path string, handler func(context.Context, *I) error, opts ...Option) {
 	registerSocket(&a.state, path, handler, opts)
 }
@@ -286,25 +290,18 @@ func registerSocket[I any](st *routerState, path string, handler func(context.Co
 	}
 	inType := reflect.TypeOf((*I)(nil)).Elem()
 	fields := collectDepFields(inType)
-	requires := make([]*depEntry, 0, len(route.requires))
-	for _, dep := range route.requires {
-		requires = append(requires, dep.dependency())
-	}
 	for _, field := range fields {
 		field.dep.bind(nil)
 	}
-	for _, dep := range requires {
-		dep.bind(nil)
-	}
+	policy := policyFrom(&route)
 	schemes := map[string]*namedScheme{}
 	seen := map[int]struct{}{}
 	for _, field := range fields {
 		field.dep.collectSchemes(seen, schemes)
 	}
-	for _, dep := range requires {
+	for _, dep := range policy.requires {
 		dep.collectSchemes(seen, schemes)
 	}
-	scopes := append([]string(nil), route.scopes...)
 	full := joinPath(st.prefix, path)
 	plan := planInput(inType)
 	max := route.wsMax
@@ -318,25 +315,20 @@ func registerSocket[I any](st *routerState, path string, handler func(context.Co
 			writeErr(w, statusErr(http.StatusMethodNotAllowed, "websocket handshake must be GET"))
 			return
 		}
-		ctx := r.Context()
-		rst, err := stateFrom(ctx)
-		if err != nil {
-			writeErr(w, err)
+		rst, ok := policy.open(w, r)
+		if !ok {
 			return
 		}
-		rst.scopes = scopes
 		in := new(I)
 		inVal := reflect.ValueOf(in).Elem()
 		if err := bindInput(r, inVal, plan); err != nil {
 			writeErr(w, err)
 			return
 		}
-		for _, dep := range requires {
-			if _, err := callDep(ctx, dep); err != nil {
-				writeErr(w, err)
-				return
-			}
+		if !policy.authorize(w, r) {
+			return
 		}
+		ctx := r.Context()
 		for _, field := range fields {
 			val, err := callDep(ctx, field.dep)
 			if err != nil {
@@ -416,6 +408,11 @@ func acceptWebSocket(w http.ResponseWriter, r *http.Request, max int) (*Conn, er
 	if err != nil || len(raw) != 16 {
 		return nil, BadRequest("invalid Sec-WebSocket-Key")
 	}
+	// Origin is checked after the handshake fields, so a bad upgrade stays
+	// 400, and before hijack, so a rejected browser never gets 101.
+	if err := checkWebSocketOrigin(r); err != nil {
+		return nil, err
+	}
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		return nil, errors.New("gfast: websocket upgrade requires http.Hijacker")
@@ -434,6 +431,139 @@ func acceptWebSocket(w http.ResponseWriter, r *http.Request, max int) (*Conn, er
 		return nil, &wsHijacked{err: err}
 	}
 	return &Conn{nc: nc, br: rw.Reader, bw: rw.Writer, role: roleServer, max: max}, nil
+}
+
+func checkWebSocketOrigin(r *http.Request) error {
+	values := r.Header.Values("Origin")
+	if len(values) > 1 {
+		return Forbidden(wsOriginRejected)
+	}
+	raw := ""
+	if len(values) == 1 {
+		raw = strings.TrimSpace(values[0])
+	}
+	if raw == "" {
+		return nil
+	}
+	originHost, ok := browserOriginHost(raw)
+	if !ok {
+		return Forbidden(wsOriginRejected)
+	}
+	if reqHost, ok := canonicalWSHost(r.Host); ok && reqHost == originHost {
+		return nil
+	}
+	st, err := stateFrom(r.Context())
+	if err != nil {
+		return Forbidden(wsOriginRejected)
+	}
+	for _, allowed := range st.app.cfg.wsOrigins {
+		if allowed == originHost {
+			return nil
+		}
+	}
+	return Forbidden(wsOriginRejected)
+}
+
+// browserOriginHost accepts an http or https Origin and returns its
+// canonical host. null and anything that is not just scheme and host is
+// rejected. Browsers send http(s), not ws(s).
+func browserOriginHost(raw string) (string, bool) {
+	if strings.EqualFold(raw, "null") || strings.ContainsAny(raw, " \t\r\n\\") {
+		return "", false
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.User != nil || u.Host == "" || u.Opaque != "" || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.ForceQuery {
+		return "", false
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https":
+	default:
+		return "", false
+	}
+	if strings.Contains(u.Host, "%") {
+		return "", false
+	}
+	return canonicalWSHost(u.Host)
+}
+
+// canonicalWSHost compares WebSocket hosts. Names are lowercased and one
+// trailing dot is removed. Port 80 and port 443, including leading zeros,
+// are omitted. Any other port is kept in decimal form.
+func canonicalWSHost(hostport string) (string, bool) {
+	hostport = strings.TrimSpace(hostport)
+	if hostport == "" || strings.ContainsAny(hostport, " /?#@\\") {
+		return "", false
+	}
+	host := hostport
+	port := ""
+	if h, p, err := net.SplitHostPort(hostport); err == nil {
+		host, port = h, p
+	} else if strings.HasPrefix(hostport, "[") && strings.HasSuffix(hostport, "]") {
+		host = hostport[1 : len(hostport)-1]
+	} else if strings.Count(hostport, ":") > 0 {
+		return "", false
+	}
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = host[1 : len(host)-1]
+	}
+	host = strings.TrimSuffix(strings.ToLower(host), ".")
+	if host == "" || strings.ContainsAny(host, " /?#@\\[]") {
+		return "", false
+	}
+	if port == "" {
+		return host, true
+	}
+	n, ok := wsPort(port)
+	if !ok {
+		return "", false
+	}
+	if n == 80 || n == 443 {
+		return host, true
+	}
+	if strings.Contains(host, ":") {
+		return net.JoinHostPort(host, strconv.Itoa(n)), true
+	}
+	return host + ":" + strconv.Itoa(n), true
+}
+
+func wsPort(s string) (int, bool) {
+	if s == "" || len(s) > 5 {
+		return 0, false
+	}
+	n := 0
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		n = n*10 + int(c-'0')
+	}
+	if n < 1 || n > 65535 {
+		return 0, false
+	}
+	return n, true
+}
+
+func normalizeWSOrigin(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		panic("gfast: empty websocket origin")
+	}
+	if strings.EqualFold(raw, "null") {
+		panic("gfast: bad websocket origin")
+	}
+	var (
+		host string
+		ok   bool
+	)
+	if strings.Contains(raw, "://") {
+		host, ok = browserOriginHost(raw)
+	} else {
+		host, ok = canonicalWSHost(raw)
+	}
+	if !ok || host == "" {
+		panic("gfast: bad websocket origin")
+	}
+	return host
 }
 
 func wsAccept(key string) string {
