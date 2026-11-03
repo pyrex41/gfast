@@ -1,0 +1,36 @@
+fuzz: elapsed: 0s, gathering baseline coverage: 0/8 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 8/8 completed, now fuzzing with 2 workers
+fuzz: elapsed: 3s, execs: 7770 (2589/sec), new interesting: 38 (total: 46)
+fuzz: elapsed: 6s, execs: 7770 (0/sec), new interesting: 38 (total: 46)
+fuzz: elapsed: 9s, execs: 7770 (0/sec), new interesting: 38 (total: 46)
+fuzz: elapsed: 12s, execs: 7770 (0/sec), new interesting: 38 (total: 46)
+fuzz: elapsed: 15s, execs: 142012 (44748/sec), new interesting: 46 (total: 54)
+fuzz: elapsed: 18s, execs: 142012 (0/sec), new interesting: 46 (total: 54)
+fuzz: elapsed: 21s, execs: 142012 (0/sec), new interesting: 46 (total: 54)
+fuzz: elapsed: 21s, execs: 142012 (0/sec), new interesting: 46 (total: 54)
+PASS
+ok  	github.com/pyrex41/gfast	21.023s
+fuzz: elapsed: 0s, gathering baseline coverage: 0/2 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 2/2 completed, now fuzzing with 2 workers
+fuzz: elapsed: 3s, execs: 39186 (13060/sec), new interesting: 56 (total: 58)
+fuzz: elapsed: 6s, execs: 64072 (8294/sec), new interesting: 68 (total: 70)
+fuzz: elapsed: 9s, execs: 86968 (7632/sec), new interesting: 75 (total: 77)
+fuzz: elapsed: 12s, execs: 86968 (0/sec), new interesting: 75 (total: 77)
+fuzz: elapsed: 15s, execs: 86968 (0/sec), new interesting: 75 (total: 77)
+fuzz: elapsed: 18s, execs: 86968 (0/sec), new interesting: 75 (total: 77)
+fuzz: elapsed: 21s, execs: 86968 (0/sec), new interesting: 75 (total: 77)
+fuzz: elapsed: 21s, execs: 86968 (0/sec), new interesting: 75 (total: 77)
+PASS
+ok  	github.com/pyrex41/gfast	21.026s
+fuzz: elapsed: 0s, gathering baseline coverage: 0/3 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 3/3 completed, now fuzzing with 2 workers
+fuzz: elapsed: 3s, execs: 69953 (23310/sec), new interesting: 37 (total: 40)
+fuzz: elapsed: 6s, execs: 132322 (20796/sec), new interesting: 74 (total: 77)
+fuzz: elapsed: 9s, execs: 173694 (13786/sec), new interesting: 84 (total: 87)
+fuzz: elapsed: 12s, execs: 253498 (26602/sec), new interesting: 98 (total: 101)
+fuzz: elapsed: 15s, execs: 281585 (9365/sec), new interesting: 112 (total: 115)
+fuzz: elapsed: 18s, execs: 309286 (9231/sec), new interesting: 120 (total: 123)
+fuzz: elapsed: 21s, execs: 327482 (6066/sec), new interesting: 122 (total: 125)
+fuzz: elapsed: 21s, execs: 327482 (0/sec), new interesting: 122 (total: 125)
+PASS
+ok  	github.com/pyrex41/gfast	21.027s

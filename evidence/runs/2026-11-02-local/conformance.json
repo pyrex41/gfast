@@ -1,0 +1,7 @@
+{
+  "openapi": "3.1.0",
+  "openapi_valid": true,
+  "body_cases": 10,
+  "query_cases": 5,
+  "scope": "fixture schema and selected boundaries, not complete JSON Schema or OAuth/WebSocket conformance"
+}

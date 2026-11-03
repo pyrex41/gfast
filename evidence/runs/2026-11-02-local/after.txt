@@ -1,0 +1,46 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/pyrex41/gfast
+cpu: Apple M1 Max
+BenchmarkHTTP/GfastJSON-10         	  901348	      1230 ns/op	    1937 B/op	      23 allocs/op
+BenchmarkHTTP/GfastJSON-10         	  975975	      1228 ns/op	    1937 B/op	      23 allocs/op
+BenchmarkHTTP/GfastJSON-10         	  993541	      1228 ns/op	    1937 B/op	      23 allocs/op
+BenchmarkHTTP/GfastJSON-10         	  990694	      1223 ns/op	    1937 B/op	      23 allocs/op
+BenchmarkHTTP/GfastJSON-10         	 1000000	      1228 ns/op	    1937 B/op	      23 allocs/op
+BenchmarkHTTP/NetHTTPJSON-10       	 1618720	       746.3 ns/op	    1088 B/op	      13 allocs/op
+BenchmarkHTTP/NetHTTPJSON-10       	 1603848	       751.4 ns/op	    1088 B/op	      13 allocs/op
+BenchmarkHTTP/NetHTTPJSON-10       	 1595311	       752.9 ns/op	    1088 B/op	      13 allocs/op
+BenchmarkHTTP/NetHTTPJSON-10       	 1593718	       752.7 ns/op	    1088 B/op	      13 allocs/op
+BenchmarkHTTP/NetHTTPJSON-10       	 1605607	       748.3 ns/op	    1088 B/op	      13 allocs/op
+BenchmarkHTTP/Query6-10            	  316576	      3810 ns/op	    3047 B/op	      49 allocs/op
+BenchmarkHTTP/Query6-10            	  314370	      3835 ns/op	    3047 B/op	      49 allocs/op
+BenchmarkHTTP/Query6-10            	  314824	      3792 ns/op	    3047 B/op	      49 allocs/op
+BenchmarkHTTP/Query6-10            	  312908	      3813 ns/op	    3047 B/op	      49 allocs/op
+BenchmarkHTTP/Query6-10            	  315952	      3806 ns/op	    3047 B/op	      49 allocs/op
+BenchmarkHTTP/Validated-10         	  191437	      6277 ns/op	    3987 B/op	      55 allocs/op
+BenchmarkHTTP/Validated-10         	  191869	      6296 ns/op	    3987 B/op	      55 allocs/op
+BenchmarkHTTP/Validated-10         	  192105	      6293 ns/op	    3986 B/op	      55 allocs/op
+BenchmarkHTTP/Validated-10         	  190525	      6301 ns/op	    3986 B/op	      55 allocs/op
+BenchmarkHTTP/Validated-10         	  187916	      6305 ns/op	    3986 B/op	      55 allocs/op
+BenchmarkHTTP/Invalid-10           	  145946	      8054 ns/op	    5379 B/op	      72 allocs/op
+BenchmarkHTTP/Invalid-10           	  151005	      7789 ns/op	    5380 B/op	      72 allocs/op
+BenchmarkHTTP/Invalid-10           	  161340	      7577 ns/op	    5379 B/op	      72 allocs/op
+BenchmarkHTTP/Invalid-10           	  161113	      7658 ns/op	    5378 B/op	      72 allocs/op
+BenchmarkHTTP/Invalid-10           	  151647	      7872 ns/op	    5379 B/op	      72 allocs/op
+BenchmarkHTTP/Auth-10              	  594948	      1977 ns/op	    2545 B/op	      29 allocs/op
+BenchmarkHTTP/Auth-10              	  606468	      2056 ns/op	    2545 B/op	      29 allocs/op
+BenchmarkHTTP/Auth-10              	  633525	      1988 ns/op	    2545 B/op	      29 allocs/op
+BenchmarkHTTP/Auth-10              	  595568	      1975 ns/op	    2545 B/op	      29 allocs/op
+BenchmarkHTTP/Auth-10              	  630211	      1976 ns/op	    2545 B/op	      29 allocs/op
+BenchmarkBindQuery-10              	  535846	      2305 ns/op	    1078 B/op	      28 allocs/op
+BenchmarkBindQuery-10              	  526328	      2311 ns/op	    1078 B/op	      28 allocs/op
+BenchmarkBindQuery-10              	  512185	      2312 ns/op	    1078 B/op	      28 allocs/op
+BenchmarkBindQuery-10              	  532255	      2284 ns/op	    1078 B/op	      28 allocs/op
+BenchmarkBindQuery-10              	  525430	      2309 ns/op	    1078 B/op	      28 allocs/op
+BenchmarkJSON-10                   	 8526685	       140.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkJSON-10                   	 8555638	       144.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkJSON-10                   	 8556004	       140.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkJSON-10                   	 8390894	       141.2 ns/op	       0 B/op	       0 allocs/op
+BenchmarkJSON-10                   	 8580422	       141.4 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/pyrex41/gfast	48.225s

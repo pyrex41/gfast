@@ -1,0 +1,131 @@
+# gfast behavioral reference
+
+A small Go API framework on the standard library. You write a function and a struct. gfast binds the request, checks struct-tag constraints, writes the JSON, and publishes OpenAPI at `/openapi.json` and Swagger UI at `/docs`. It has no third-party runtime Go dependencies; Hegel is a test dependency. Swagger UI 5.34.1 is included in the binary, under the Apache 2.0 license.
+
+See the [quick start](../README.md), [invariant catalog](invariants.md) and [evidence](evidence.md). Finish configuration before concurrent serving. Provider registration is process-global; app overrides are isolated.
+
+For development, use the formatter belonging to the selected Go toolchain: `"$(go env GOROOT)/bin/gofmt"`. An older system `gofmt` may reject the generic methods even when `go test` selects Go 1.27 automatically.
+
+Request-scoped closers are attempted in reverse acquisition order. A panicking closer no longer prevents remaining closers from running; the first closer panic is rethrown afterward. A background-task panic stops subsequent tasks but still triggers resource cleanup. Close errors remain ignored. Blocking callbacks, `runtime.Goexit`, and process termination are outside this cleanup guarantee.
+
+OAuth refresh consumption burns the old token before scope validation/replacement issuance. A later failure does not restore it, and concurrent issuers can fill a freed storage slot. See the [model and implementation trace](../formal/README.md).
+
+Go 1.27 can put type parameters on a method, so a route hangs off the app. The part that matches FastAPI's `Depends` is a named provider: auth, a database session, or anything else you would otherwise stuff into middleware and pull back out of `context`.
+
+```go
+var CurrentUser = gfast.Dep("CurrentUser", func(ctx context.Context, cred gfast.Bearer) (User, error) {
+    user, err := users.FromToken(ctx, cred.Token)
+    if err != nil {
+        return User{}, gfast.Unauthorized("invalid token")
+    }
+    return user, nil
+})
+
+type GetItemInput struct {
+    ID   string `path:"id" doc:"Item id"`
+    User User   `gfast:"dep=CurrentUser"`
+}
+
+func main() {
+    app := gfast.New(gfast.Title("Items"), gfast.Version("0.1.0"))
+    app.Get("/items/{id}", GetItem, gfast.Summary("Get one item"))
+    app.Run(":8080")
+}
+
+func GetItem(ctx context.Context, in *GetItemInput) (*Item, error) {
+    return store.Find(ctx, in.ID, in.User.ID)
+}
+```
+
+`CurrentUser` takes `gfast.Bearer`, so the operation is documented with `bearerAuth`. A missing token is 401. The same dependency runs once per request when several fields use it.
+
+Require it for a whole group when the handler does not read the value:
+
+```go
+api := app.Group("/v1", gfast.Require(CurrentUser))
+api.Get("/items", ListItems)
+```
+
+Tests replace a provider by identity. The replacement function is the one that runs, so a double that only takes `context` does not ask for a token:
+
+```go
+app.Override(CurrentUser, func(ctx context.Context) (User, error) {
+    return User{ID: "u_test"}, nil
+})
+res := app.Request(http.MethodGet, "/items/1", nil)
+```
+
+A working example is `examples/items`.
+
+## What you get
+
+- Path, query, header, cookie, form, file, and JSON body binding. Query, header, and cookie fields are optional unless tagged `required:"true"`. `default` fills a missing scalar. A slice query or header field takes every value. `doc` is the OpenAPI description. `encoding/json/v2` rejects unknown fields unless the struct says `extra:"allow"`, and it rejects duplicate names and invalid UTF-8. Constraint tags and a `Validate() error` method return 422 problem details with an `errors` array. A JSON property is listed in the schema `required` array unless its `json` tag has `omitempty` or `omitzero`. `required:"true"` is always listed and rejects a missing key with 422. An empty body and `{}` do not satisfy that property. A present zero and a present null are not missing keys: null stays nil on a pointer, and other types follow `encoding/json/v2`. Schemas use the JSON wire types. `time.Time` is a string with format `date-time`. `[]byte` and `[N]byte` are a string with format `byte`. A slice of any other element type stays an array. On an output schema, a field named `Body` or `RawBody` is an ordinary JSON field when it has a JSON name. `Body` is the request body only on the handler input.
+- Dependencies filled from `gfast:"dep=Name"` fields before the handler runs. Extra provider parameters are dependencies matched by type.
+- `Bearer`, `Basic`, `APIKeyHeader`, `APIKeyQuery`, and `APIKeyCookie`. `Optional` on those readers leaves a missing credential as the zero value and still returns 401 when the value was sent but does not parse. Taking `Bearer` or `Basic` as a provider parameter attaches the required scheme. `BearerAuth` and `BasicAuth` are those dependencies when a group needs `Require`. The optional names are `bearerAuthOptional`, `basicAuthOptional`, and the API key name with `_optional` appended. Route scopes stay on `Bearer` and on the `bearerAuth` operation. The framework does not reject a token for missing scopes. With `OAuthServer`, the server's validator checks the access token first and fills `Subject`, `ClientID`, and `TokenScopes`.
+- `Require` on an app or a group.
+- `Override` for tests, and `Request` so tests do not open a port. `Request` is one shot: it does not keep cookies, follow redirects, or run `OnStart`.
+- `Client` keeps a cookie jar across requests and follows at most 10 same-host redirects (`301`, `302`, `303`, `307`, `308`). A redirect to another host is returned as-is. `301`, `302`, and `303` from a non-GET continue as GET without the body. `Start` runs `OnStart` before requests. `Close` runs `OnStop` when start succeeded. `FollowRedirects` can be set false.
+- `Background` after the response is written, then `io.Closer` on dependency values, in reverse order.
+- `OnStart` and `OnStop`. `Run` stops on SIGINT and SIGTERM. Both hooks receive the app state map on their context. `State` and `StateFrom` are that map. Handlers read it with `StateFrom`. `RequestFrom` returns the current `*http.Request`. The map is not safe for concurrent writes.
+- `CORS(origins...)`. An origin of `*` allows every origin, and any other origin that contains `*` is a pattern. `AllowOriginPattern` adds a regular expression matched against the whole origin. `AllowCredentials`, `ExposeHeaders`, and `MaxAge` extend the same check. With no origins, every origin is echoed unless credentials are on. Credentials require a listed origin or a pattern and never echo an arbitrary origin.
+- `Use` adds middleware of type `func(http.Handler) http.Handler`. It runs outside the router and inside CORS. The first middleware registered is the outermost. `Gzip` wraps it, so middleware sees the uncompressed response.
+- `MaxBodyBytes` caps the request body. Zero, including the default, means 1 MiB. A negative value panics. A group or a route replaces the app limit, and a group passes that limit on. A body over the limit is 413 `application/problem+json` before the handler runs. `Content-Length` above the limit is rejected without reading the rest. A shorter non-zero length and a chunked body still stop at the limit, after at most one extra byte, and are not parsed. `Content-Length: 0` stays an empty body and is not read. JSON, urlencoded forms, multipart, CSRF token extraction, and the OAuth authorize and token forms all use that cap. Multipart's memory argument stays a spill threshold. Spill files are removed when the request finishes. `Require`, including a bearer check that does not read the body, runs only after a body that fits, so an oversized body is 413 rather than a later auth error. One rejected request does not affect the next.
+- `Gzip` compresses responses when the client accepts gzip. An explicit `gzip` token beats `*`, so `gzip;q=0` stays uncompressed even when the wildcard quality is higher. A lone `*` still selects gzip. Duplicate `gzip` tokens select gzip when any of them has a positive quality. A missing `q` means 1, the first `q` wins, a `q` above 1 counts as 1, and a negative or non-numeric `q` counts as 0 while still marking an explicit token. A missing `Accept-Encoding` header does not select gzip. A response that already has a content encoding is left alone, and event streams are not compressed. HEAD, 204, and 304 are not compressed. A gzip response varies on `Accept-Encoding`.
+- A path that matches nothing is 404 `application/problem+json`. The same path with the wrong method is 405 problem+json and includes an `Allow` header. `Mount` serves an `http.Handler` under a prefix. `Static` serves a directory with the standard file server for GET and HEAD. Both inherit `Require`, scopes, and CSRF from the app or group, including `SkipCSRF`. A rejecting dependency does not run the mounted handler or the file server. An unsafe mounted request that fails CSRF is 403 and does not run the handler. Other methods on a static prefix stay 405 and do not run that policy. The prefix is stripped. ServeMux redirects a request for the prefix without a trailing slash before that policy; gfast does not add another redirect. `/docs`, `/openapi.json`, and `/oauth` stay outside `Require`.
+- `TrustedHost` rejects a request whose host is not listed. `*` allows any host, and `*.example.com` allows that suffix. A listed `www` host redirects the apex host there. `HTTPSRedirect` sends plain HTTP to HTTPS.
+- `Sessions` stores a JSON object in a versioned HMAC-signed cookie. It is off unless that option is passed to `New`. `MaxAge` above zero is also the server lifetime. `MaxAge` zero is a browser session with no server expiry. CSRF checks are on for unsafe requests that send that cookie. See below.
+- OpenAPI 3.1 at `/openapi.json` and Swagger UI at `/docs`, served by the app. `Docs(false)` leaves both unregistered. A named struct is one `components.schemas` entry, and operations point at it with `$ref`. Anonymous structs stay inline. `doc` is the parameter or property description. `example` is the schema example. `Deprecated`, `OperationID`, `ExternalDocs`, `Servers`, `TagDescription`, and `IncludeInSchema` fill the document. `Webhooks` and `Callbacks` copy caller-supplied fragments onto it and do not call them. `OpenAPIHook` can edit the document after routes are registered and before it is served.
+- Optional OAuth 2.1 authorization server. See below.
+
+Handlers are `func(ctx context.Context, in *In) (*Out, error)`. Return `nil, nil` for 204. Set the success status with `gfast.Status`. Put a JSON body in a field named `Body`. `gfast.Get(app, ...)` still works when the router is an interface.
+
+## Sessions
+
+`Sessions` is off unless it is passed to `New`. The cookie is named `session`. Its value is a versioned HMAC-signed JSON envelope around the session object. Nothing is stored on the server. Handlers read and write the map from `SessionFrom`. The cookie is sent only when the map changed. Clearing every key deletes the cookie the browser will send next. It does not revoke a copy the client already kept.
+
+The cookie defaults to `HttpOnly`, `SameSite=Lax`, and `Path=/`. `Secure` sets the Secure attribute. `MaxAge` above zero is both the cookie Max-Age and the server lifetime: the envelope carries that deadline, and a copy is rejected when the deadline is now or earlier. Zero omits `Max-Age` and omits the server deadline, so the browser drops the cookie when the session ends and a copied cookie still loads. `SameSite` accepts Lax, Strict, and None. None requires `Secure`. A missing cookie, a cookie from before this envelope, a bad signature, a bad version, or a tampered expiry is an empty map, not a 500.
+
+CSRF checks run only when sessions are on. They apply to `POST`, `PUT`, `PATCH`, and `DELETE` that send the `session` cookie, including a handler registered with `Mount`. Safe methods are not checked. A request with no session cookie is not checked, including a bearer request. `NoCSRF` turns the checks off for the app. `SkipCSRF` turns them off for one route, and a group passes that on to its routes, mounts, and static files. `Static` does not serve unsafe methods.
+
+The default check uses Fetch Metadata and the origin. `Sec-Fetch-Site: cross-site` is 403 problem+json. When that header is absent, the `Origin` host, or the `Referer` host if there is no `Origin`, must be this request's host or a host passed to `CSRFOrigins`. A client that sends neither `Origin` nor `Sec-Fetch-Site`, such as curl with the cookie, is allowed. `CSRFStrict` also rejects `Sec-Fetch-Site: same-site`.
+
+`CSRFToken` stores a synchronizer token in the session and copies it to a `csrf_token` cookie that is not `HttpOnly`, so same-origin JavaScript can read it. An unsafe cookie request must send that value in the `X-CSRF-Token` header or a `csrf_token` form field. The comparison is constant time. A missing or wrong token is 403. `CSRFTokenFrom` returns the current token. Token mode can be combined with the default checks and with `CSRFStrict`.
+
+```go
+app := gfast.New(gfast.Sessions(gfast.SessionConfig{Secret: "change-me"}))
+
+func Login(ctx context.Context, in *LoginInput) (*struct{}, error) {
+    gfast.SessionFrom(ctx)["user"] = in.Name
+    return &struct{}{}, nil
+}
+```
+
+## OAuth 2.1
+
+`OAuthServer` mounts an authorization server in this process. Nothing is mounted unless that option is set. Register clients, and a function that checks a password, a session, or both.
+
+- `GET` and `POST /oauth/authorize` issue an authorization code. PKCE S256 is required. `POST /oauth/token` exchanges the code, rotates a refresh token, and serves the client-credentials grant. Client credentials requires a client secret. The password grant is offered only when `Password` is set, so Swagger UI's password flow can obtain a token.
+- Access tokens are bearer tokens signed by this process. `Bearer` verifies them through the validator the server installs.
+- Authorization codes and refresh tokens are stored in memory until that token is presented, including after expiry. Issuing or consuming a code or a refresh token deletes expired codes and expired refresh tokens first. There is no background sweep, and a live token is not evicted to make room. `MaxCodes` and `MaxRefresh` cap the two maps. Zero means 1024. A negative cap panics at startup. After expired entries are removed, a new code or refresh token that would exceed its cap is refused with HTTP 503 and an OAuth `server_error` body (`token storage is full`). A process restart drops the maps. The signing key is in memory as well, so access tokens from before the restart no longer verify. Codes last one minute, access tokens one hour, and refresh tokens 24 hours. A refresh token works once. `CodeTTL`, `AccessTTL`, and `RefreshTTL` override those lifetimes. Zero keeps the default. A negative duration is already expired and is deleted by the next sweep. `Now`, when set, is the clock for those lifetimes.
+- Swagger UI uses `oauth2RedirectUrl` `window.location.origin + "/docs/oauth2-redirect"`. That page is the vendored Swagger UI 5.34.1 handshake (`oauth2-redirect.html` and `oauth2-redirect.js`). When the server is enabled, `bearerAuth` is an OAuth 2.0 scheme whose authorization and token URLs are `/oauth/authorize` and `/oauth/token`, and PKCE is turned on. The docs redirect on the request host is accepted in addition to each client's registered redirect URIs, so Authorize in `/docs` can finish with a bearer token. A registered path such as `/docs/oauth2-redirect` matches that path on the request host.
+- OpenID Connect discovery, dynamic client registration, and the device-code grant are not implemented.
+
+```go
+app := gfast.New(gfast.OAuthServer(gfast.OAuthConfig{
+    Clients: []gfast.OAuthClient{{
+        ID:           "docs",
+        RedirectURIs: []string{"/docs/oauth2-redirect"},
+    }},
+    Scopes: map[string]string{"items:read": "Read items"},
+    Password: func(ctx context.Context, username, password string) (string, error) {
+        if username == "ada" && password == "secret" {
+            return "user-ada", nil
+        }
+        return "", gfast.Unauthorized("invalid username or password")
+    },
+}))
+```
+
+## What this is not
+
+gfast does not ship a database or a full JSON Schema validator. The items example checks a fixed dev token. The authorization server above is optional and in-memory.

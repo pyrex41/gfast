@@ -1,0 +1,79 @@
+name: Quality evidence
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 4 * * 1'
+permissions:
+  contents: read
+jobs:
+  correctness:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go vet ./...
+      - run: go test -race -count=1 -coverprofile=coverage.out ./...
+      - run: python3 scripts/check-contracts.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.os }}
+          path: coverage.out
+  adversarial:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test -run '^$' -fuzz '^FuzzJSONBinding$' -fuzztime=30s -parallel=2 .
+      - run: go test -run '^$' -fuzz '^FuzzMultipart$' -fuzztime=30s -parallel=2 .
+      - run: go test -run '^$' -fuzz '^FuzzAccessToken$' -fuzztime=30s -parallel=2 .
+      - run: python3 scripts/mutate.py
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: regression-corpora
+          path: |
+            testdata/fuzz
+            hegel-db
+  conformance-model:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - run: pip install -r tools/conformance/requirements.txt
+      - run: python scripts/conformance.py
+      - run: python scripts/check-model.py
+  benchmark-artifact:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: python3 scripts/evidence.py --bench
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-evidence
+          path: evidence/local

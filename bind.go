@@ -214,6 +214,9 @@ func bindInput(r *http.Request, dst reflect.Value, plan inputPlan) error {
 		return err
 	}
 	var issues []fieldIssue
+	// URL.Query parses and allocates on every call. Share its result across
+	// query fields within this binding, without retaining mutable request state.
+	var query url.Values
 	for _, p := range plan.params {
 		field := fieldByIndexAlloc(dst, p.index)
 		if p.loc == "file" {
@@ -224,7 +227,10 @@ func bindInput(r *http.Request, dst reflect.Value, plan inputPlan) error {
 			issues = append(issues, got...)
 			continue
 		}
-		vals, ok, err := paramValues(r, p)
+		if p.loc == "query" && query == nil {
+			query = r.URL.Query()
+		}
+		vals, ok, err := paramValues(r, p, query)
 		if err != nil {
 			return err
 		}
@@ -304,7 +310,7 @@ func headerBreak(s string) bool {
 	return strings.ContainsAny(s, "\x00\r\n")
 }
 
-func paramValues(r *http.Request, p paramField) ([]string, bool, error) {
+func paramValues(r *http.Request, p paramField, query url.Values) ([]string, bool, error) {
 	switch p.loc {
 	case "path":
 		v := r.PathValue(p.name)
@@ -313,7 +319,7 @@ func paramValues(r *http.Request, p paramField) ([]string, bool, error) {
 		}
 		return []string{v}, true, nil
 	case "query":
-		vs := r.URL.Query()[p.name]
+		vs := query[p.name]
 		if len(vs) == 0 {
 			return nil, false, nil
 		}

@@ -1,0 +1,8 @@
+ok  	github.com/pyrex41/gfast	11.824s	coverage: 83.7% of statements
+ok  	github.com/pyrex41/gfast/examples/items	1.022s	coverage: 66.7% of statements
+	github.com/pyrex41/gfast/tools/benchserver		coverage: 0.0% of statements
+	github.com/pyrex41/gfast/tools/load		coverage: 0.0% of statements
+31 invariant/objective entries: IDs, statuses and evidence references valid
+nethttp: 6 runs saved
+gfast: 24 runs saved
+fastapi: 24 runs saved

@@ -599,8 +599,21 @@ func (a *App) withState(next http.Handler) http.Handler {
 		r = r.WithContext(ctx)
 		st.req = r
 		defer func() {
+			// A faulty closer must not strand resources acquired before it.
+			// Preserve panic visibility after attempting all remaining closes.
+			var firstPanic any
 			for i := len(st.closers) - 1; i >= 0; i-- {
-				_ = st.closers[i].Close()
+				func() {
+					defer func() {
+						if value := recover(); value != nil && firstPanic == nil {
+							firstPanic = value
+						}
+					}()
+					_ = st.closers[i].Close()
+				}()
+			}
+			if firstPanic != nil {
+				panic(firstPanic)
 			}
 		}()
 		defer func() {

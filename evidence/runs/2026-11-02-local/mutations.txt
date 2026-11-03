@@ -1,0 +1,58 @@
+authorization-bypass: killed
+memoization-disabled: killed
+cleanup-forward: killed
+refresh-reuse: killed
+capacity-bypass: killed
+expiry-inclusive: killed
+scope-escalation: killed
+body-cap-bypass: killed
+[
+  {
+    "name": "authorization-bypass",
+    "test": "TestContractAuthorizationMetamorphic",
+    "killed": true,
+    "output": "--- FAIL: TestContractAuthorizationMetamorphic (0.00s)\n    contracts_test.go:163: token \"\" extra \"\": status=200 calls=1\nFAIL\nFAIL\tgithub.com/pyrex41/gfast\t0.013s\nFAIL\n"
+  },
+  {
+    "name": "memoization-disabled",
+    "test": "TestContractDependencyCleanup",
+    "killed": true,
+    "output": "--- FAIL: TestContractDependencyCleanup (0.00s)\n    --- FAIL: TestContractDependencyCleanup/success (0.00s)\n        contracts_test.go:59: request memoization lost identity\n        contracts_test.go:92: events [acquire:root acquire:root acquire:root acquire:leaf close:leaf close:root close:root close:root] want [acquire:root acquire:leaf close:leaf close:root]\n    --- FAIL: TestContractDependencyCleanup/error (0.00s)\n        contracts_test.go:59: request memoization lost identity\n        contracts_test.go:92: events [acquire:root acquire:root acquire:root acquire:leaf close:leaf close:root close:root close:root] want [acquire:root acquire:leaf close:leaf close:root]\n    --- FAIL: TestContractDependencyCleanup/panic (0.00s)\n        contracts_test.go:59: request memoization lost identity\n        contracts_test.go:92: events [acquire:root acquire:root acquire:root acquire:leaf close:leaf close:root close:root close:root] want [acquire:root acquire:leaf close:leaf close:root]\n    --- FAIL: TestContractDependencyCleanup/cancel (0.00s)\n        contracts_test.go:59: request memoization lost identity\n        contracts_test.go:92: events [acquire:root acquire:root acquire:root acquire:leaf close:leaf close:root close:root close:root] want [acquire:root acquire:leaf close:leaf close:root]\n    --- FAIL: TestContractDependencyCleanup/partial (0.00s)\n        contracts_test.go:92: events [acquire:root acquire:root acquire:root close:root close:root close:root] want [acquire:root close:root]\nFAIL\nFAIL\tgithub.com/pyrex41/gfast\t0.013s\nFAIL\n"
+  },
+  {
+    "name": "cleanup-forward",
+    "test": "TestContractDependencyCleanup",
+    "killed": true,
+    "output": "--- FAIL: TestContractDependencyCleanup (0.00s)\n    --- FAIL: TestContractDependencyCleanup/success (0.00s)\n        contracts_test.go:92: events [acquire:root acquire:leaf close:root close:leaf] want [acquire:root acquire:leaf close:leaf close:root]\n    --- FAIL: TestContractDependencyCleanup/error (0.00s)\n        contracts_test.go:92: events [acquire:root acquire:leaf close:root close:leaf] want [acquire:root acquire:leaf close:leaf close:root]\n    --- FAIL: TestContractDependencyCleanup/panic (0.00s)\n        contracts_test.go:92: events [acquire:root acquire:leaf close:root close:leaf] want [acquire:root acquire:leaf close:leaf close:root]\n    --- FAIL: TestContractDependencyCleanup/cancel (0.00s)\n        contracts_test.go:92: events [acquire:root acquire:leaf close:root close:leaf] want [acquire:root acquire:leaf close:leaf close:root]\nFAIL\nFAIL\tgithub.com/pyrex41/gfast\t0.014s\nFAIL\n"
+  },
+  {
+    "name": "refresh-reuse",
+    "test": "TestContractOAuthConcurrentConsume",
+    "killed": true,
+    "output": "--- FAIL: TestContractOAuthConcurrentConsume (0.00s)\n    --- FAIL: TestContractOAuthConcurrentConsume/refresh (0.00s)\n        contracts_test.go:216: 32 consumers succeeded\nFAIL\nFAIL\tgithub.com/pyrex41/gfast\t0.012s\nFAIL\n"
+  },
+  {
+    "name": "capacity-bypass",
+    "test": "TestContractOAuthCapacityFailureTrace",
+    "killed": true,
+    "output": "--- FAIL: TestContractOAuthCapacityFailureTrace (0.00s)\n    contracts_test.go:273: want capacity failure: <nil>\nFAIL\nFAIL\tgithub.com/pyrex41/gfast\t0.013s\nFAIL\n"
+  },
+  {
+    "name": "expiry-inclusive",
+    "test": "TestContractOAuthExpiryBoundary",
+    "killed": true,
+    "output": "--- FAIL: TestContractOAuthExpiryBoundary (0.00s)\n    contracts_test.go:295: token valid at expiry\nFAIL\nFAIL\tgithub.com/pyrex41/gfast\t0.014s\nFAIL\n"
+  },
+  {
+    "name": "scope-escalation",
+    "test": "TestContractOAuthRotation",
+    "killed": true,
+    "output": "--- FAIL: TestContractOAuthRotation (0.00s)\n    contracts_test.go:251: scope escalation accepted\nFAIL\nFAIL\tgithub.com/pyrex41/gfast\t0.013s\nFAIL\n"
+  },
+  {
+    "name": "body-cap-bypass",
+    "test": "TestIssue9ChunkedTCP",
+    "killed": true,
+    "output": "--- FAIL: TestIssue9ChunkedTCP (0.00s)\n    hegel_review_test.go:3926: tcp chunked 200 hits 1\nFAIL\nFAIL\tgithub.com/pyrex41/gfast\t0.013s\nFAIL\n"
+  }
+]

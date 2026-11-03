@@ -1,0 +1,23 @@
+File: gfast.test
+Type: cpu
+Time: 2026-11-02 21:37:09 CST
+Duration: 3.73s, Total samples = 3.62s (97.10%)
+Showing nodes accounting for 2.87s, 79.28% of 3.62s total
+Dropped 56 nodes (cum <= 0.02s)
+Showing top 15 nodes out of 80
+      flat  flat%   sum%        cum   cum%
+     0.01s  0.28%  0.28%      2.62s 72.38%  runtime.systemstack
+         0     0%  0.28%      2.45s 67.68%  runtime.gcStart.func4
+     2.45s 67.68% 67.96%      2.45s 67.68%  runtime.kevent
+         0     0% 67.96%      2.45s 67.68%  runtime.netpoll
+         0     0% 67.96%      2.45s 67.68%  runtime.startTheWorldWithSema
+         0     0% 67.96%         1s 27.62%  github.com/pyrex41/gfast.BenchmarkBindQuery
+     0.01s  0.28% 68.23%         1s 27.62%  github.com/pyrex41/gfast.bindInput
+         0     0% 68.23%         1s 27.62%  testing.(*B).run1.func1
+         0     0% 68.23%         1s 27.62%  testing.(*B).runN
+     0.01s  0.28% 68.51%      0.63s 17.40%  github.com/pyrex41/gfast.validateStruct
+     0.32s  8.84% 77.35%      0.39s 10.77%  reflect.StructTag.Lookup
+     0.05s  1.38% 78.73%      0.33s  9.12%  github.com/pyrex41/gfast.checkField
+         0     0% 78.73%      0.30s  8.29%  reflect.StructTag.Get (inline)
+     0.02s  0.55% 79.28%      0.28s  7.73%  github.com/pyrex41/gfast.scalarChecks
+         0     0% 79.28%      0.20s  5.52%  net/url.(*URL).Query

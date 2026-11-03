@@ -1,0 +1,65 @@
+BASELINE
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Running breadth-first search Model-Checking with fp 55 and seed -2501291593821019987 with 1 worker on 10 cores with 7282MB heap and 64MB offheap memory [pid: 84078] (Mac OS X 26.5.2 aarch64, Homebrew 25.0.1 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /private/var/folders/nh/ncg8xhd91h925n5nzgysjs6c0000gn/T/gfast-tlc-z1r3n_to/OAuth.tla
+Parsing file /private/var/folders/nh/ncg8xhd91h925n5nzgysjs6c0000gn/T/Naturals.tla
+Parsing file /private/var/folders/nh/ncg8xhd91h925n5nzgysjs6c0000gn/T/FiniteSets.tla
+Parsing file /private/var/folders/nh/ncg8xhd91h925n5nzgysjs6c0000gn/T/Sequences.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module OAuth
+Starting... (2026-11-02 21:36:10)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-11-02 21:36:10.
+Model checking completed. No error has been found.
+  Estimates of the probability that TLC did not check all reachable states
+  because two distinct states had the same fingerprint:
+  calculated (optimistic):  val = 1.4E-11
+34540 states generated, 10373 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 16.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 8 and the 95th percentile is 3).
+Finished in 00s at (2026-11-02 21:36:10)
+
+NEGATIVE CONTROL
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Running breadth-first search Model-Checking with fp 96 and seed 7213958357665142894 with 1 worker on 10 cores with 7282MB heap and 64MB offheap memory [pid: 84088] (Mac OS X 26.5.2 aarch64, Homebrew 25.0.1 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /private/var/folders/nh/ncg8xhd91h925n5nzgysjs6c0000gn/T/gfast-tlc-z1r3n_to/OAuth.tla
+Parsing file /private/var/folders/nh/ncg8xhd91h925n5nzgysjs6c0000gn/T/Naturals.tla
+Parsing file /private/var/folders/nh/ncg8xhd91h925n5nzgysjs6c0000gn/T/FiniteSets.tla
+Parsing file /private/var/folders/nh/ncg8xhd91h925n5nzgysjs6c0000gn/T/Sequences.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module OAuth
+Starting... (2026-11-02 21:36:11)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-11-02 21:36:11.
+Error: Invariant NoResurrection is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ pending = (a1 :> none @@ a2 :> none)
+/\ live = {}
+/\ consumed = (c1 :> 0 @@ c2 :> 0 @@ r1 :> 0 @@ r2 :> 0 @@ r3 :> 0)
+/\ granted = (c1 :> 0 @@ c2 :> 0 @@ r1 :> 0 @@ r2 :> 0 @@ r3 :> 0)
+/\ unused = {c1, c2, r1, r2, r3}
+
+State 2: <Issue line 18, col 13 to line 21, col 55 of module OAuth>
+/\ pending = (a1 :> none @@ a2 :> none)
+/\ live = {c1}
+/\ consumed = (c1 :> 0 @@ c2 :> 0 @@ r1 :> 0 @@ r2 :> 0 @@ r3 :> 0)
+/\ granted = (c1 :> 0 @@ c2 :> 0 @@ r1 :> 0 @@ r2 :> 0 @@ r3 :> 0)
+/\ unused = {c2, r1, r2, r3}
+
+State 3: <Consume line 25, col 18 to line 29, col 49 of module OAuth>
+/\ pending = (a1 :> c1 @@ a2 :> none)
+/\ live = {c1}
+/\ consumed = (c1 :> 1 @@ c2 :> 0 @@ r1 :> 0 @@ r2 :> 0 @@ r3 :> 0)
+/\ granted = (c1 :> 0 @@ c2 :> 0 @@ r1 :> 0 @@ r2 :> 0 @@ r3 :> 0)
+/\ unused = {c2, r1, r2, r3}
+
+11 states generated, 11 distinct states found, 8 states left on queue.
+The depth of the complete state graph search is 3.
+The average outdegree of the complete state graph is 5 (minimum is 5, the maximum 5 and the 95th percentile is 5).
+Finished in 00s at (2026-11-02 21:36:11)
+

@@ -2,3 +2,7 @@
 *.test
 *.out
 /bin/
+/evidence/local/
+/.venv/
+__pycache__/
+/formal/states/
